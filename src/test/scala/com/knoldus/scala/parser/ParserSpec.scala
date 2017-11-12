@@ -7,10 +7,10 @@ import org.scalatest.WordSpec
 class ParserSpec extends WordSpec{
 
   val parser = new Parser
-  val cpdXmlPath = "/home/anuj/workspace/POC/scalaxb/src/main/resources/cpd.xml"
-  val cpdXsdPath = "/home/anuj/workspace/POC/scalaxb/src/main/resources/cpd.xsd"
-  val shipOrderXmlPath = "/home/anuj/workspace/POC/scalaxb/src/main/resources/shiporder.xml"
-  val shipOrderXsdPath = "/home/anuj/workspace/POC/scalaxb/src/main/resources/shiporder.xsd"
+  val cpdXmlPath = "src/main/resources/cpd.xml"
+  val cpdXsdPath = "src/main/resources/cpd.xsd"
+  val shipOrderXmlPath = "src/main/resources/shiporder.xml"
+  val shipOrderXsdPath = "src/main/resources/shiporder.xsd"
 
   "Parser" should {
     "validate cpd files successfully" in {

@@ -6,9 +6,9 @@ import com.knoldus.scala.parser.Parser
 
 object ParserApplication extends App{
   val parser = new Parser
-  private val xmlPath = "/home/anuj/workspace/POC/scalaxb/src/main/resources/cpd.xml"
+  private val xmlPath = "src/main/resources/cpd.xml"
   private val xmlInputStream = new FileInputStream(xmlPath)
-  private val xsdPath = "/home/anuj/workspace/POC/scalaxb/src/main/resources/cpd.xsd"
+  private val xsdPath = "src/main/resources/cpd.xsd"
   if (parser.validateXML(xmlInputStream, xsdPath)) {
     println("successfully validated")
   } else {
