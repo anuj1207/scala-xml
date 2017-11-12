@@ -1,0 +1,3863 @@
+<?xml version="1.0" encoding="utf-8"?>
+<pmd-cpd>
+  <duplication lines="422" tokens="2274">
+    <file line="1" path="/home/knoldus/Documents/CodeSquad/server/app/util/S3Util.scala"/>
+    <file line="1" path="/home/knoldus/Documents/CodeSquad/server/app/util/S3Util.scala"/>
+    <codefragment><![CDATA[package util
+
+import java.io.{ InputStreamReader, _ }
+import java.text.SimpleDateFormat
+import java.util.Calendar
+
+import scala.collection.JavaConverters._
+import scala.collection.mutable.ListBuffer
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.Future
+import scala.concurrent.duration.DurationInt
+import scala.io.Source
+import scala.language.postfixOps
+import scala.xml.Elem
+import scala.xml.XML._
+
+import akka.actor.{ ActorSystem, Props }
+import akka.pattern.ask
+import akka.util.Timeout
+import com.amazonaws.services.s3.model.{ GetObjectRequest, ListObjectsRequest, S3Object }
+import com.amazonaws.util.StringUtils
+import model.ParsersResponse._
+import model.Result
+import org.xml.sax.SAXParseException
+import play.api.Logger
+import reportsParsers.ParserCalling.{ Parse, StringParser }
+import reportsParsers._
+import util.Constant._
+
+trait S3Util extends JsonHelper {
+
+  val constant = Constant
+
+  val system = ActorSystem("Parsers")
+
+  val ref1 = system.actorOf(Props[ScalaStyleWarningParserActor])
+  val ref2 = system.actorOf(Props[ScapegoatParserActor])
+  val ref3 = system.actorOf(Props[ScoverageParserActor])
+  val ref4 = system.actorOf(Props[CopyPasteDetectorParserActor])
+  val ref5 = system.actorOf(Props[ScalaStyleXmlReportParserActor])
+  val ref6 = system.actorOf(Props[ScapeGoatHtmlParserActor])
+  val ref7 = system.actorOf(Props[LOCParserActor])
+
+  implicit val timeout = Timeout(2 minute)
+
+  def findWarning(project: String, module: String): (String, String, String) = {
+    try {
+      val s3object: S3Object = s3client
+        .getObject(new GetObjectRequest(project, module + constant.SCALASTYLEXML))
+      val objectSummary = s3object.getObjectMetadata
+      val modifiedDate = StringUtils.fromDate(objectSummary.getLastModified) substring (0, 10)
+      val dateFormat = new SimpleDateFormat("yyyy-MM-dd")
+      val currentDate = dateFormat.format(Calendar.getInstance().getTime)
+      val diff = currentDate compareTo modifiedDate
+      val scalaStyleXml = load(new InputStreamReader(s3object.getObjectContent))
+      val result = for {
+        check <- scalaStyleXml \\ constant.ERROR
+        if ((check \ constant.SEVERITY).text == constant.WARNING ||
+          (check \ constant.SEVERITY).text == constant.WARNINGTEXT)
+        node <- check
+      } yield {
+        node
+      }
+
+      (result.length.toString, modifiedDate, diff.toString)
+    } catch {
+      case ex: Exception => {
+        val s3object: S3Object = s3client.getObject(new GetObjectRequest(project, module))
+        val objectSummary = s3object.getObjectMetadata
+        val modifiedDate = StringUtils.fromDate(objectSummary.getLastModified) substring (0, 10)
+        val dateFormat = new SimpleDateFormat("yyyy-MM-dd")
+        val currentDate = dateFormat.format(Calendar.getInstance().getTime)
+        val diff = currentDate compareTo modifiedDate
+        (constant.NA, modifiedDate, diff.toString)
+      }
+    }
+
+  }
+
+  /**
+   * Calculates total number of coverage in the XML file
+   *
+   * @param version
+   * @param file
+   * @return coverage report
+   */
+  def findScoverageReport(version: String, file: String): String = {
+
+    def findScoverage(project: String, module: String): String = {
+
+      constant.XMLPATH.substring(constant.LIMIT)
+      try {
+        val s3object: S3Object = s3client
+          .getObject(new GetObjectRequest(project, module + constant.TARGET + version +
+            constant.XMLPATH.substring(constant.LIMIT)))
+        val scoverageXml = load(new InputStreamReader(s3object.getObjectContent))
+
+        (scoverageXml \\ constant.SCOVERAGE \ constant.STATEMENTRATE).toString
+
+      } catch {
+        case ex: Exception => {
+          try {
+            val s3object: S3Object = s3client
+              .getObject(new GetObjectRequest(project, module + constant.XMLPATH))
+            val scoverageXml = load(new InputStreamReader(s3object.getObjectContent))
+
+            (scoverageXml \\ constant.SCOVERAGE \ constant.STATEMENTRATE).toString
+          } catch {
+            case ex: Exception => constant.NA
+          }
+        }
+      }
+    }
+
+    if (file contains constant.DELIMITER) {
+      val project = file.split(constant.DELIMITER)(0)
+      val module = file.split(constant.DELIMITER)(1) + constant.DELIMITER +
+        file.split(constant.DELIMITER)(2) + constant.DELIMITER
+      findScoverage(project, module)
+    } else {
+      findScoverage(file, "")
+    }
+  }
+
+  def findScapegoatHTMLReport(version: String, file: String): (String) = {
+    def findScapegoatHTML(project: String, module: String): String = {
+      try {
+        val s3object: S3Object = s3client.getObject(new GetObjectRequest(
+          project,
+          module + constant.TARGET + version + constant.SCAPEGOATHTMLPATH.substring(constant.LIMIT)
+        ))
+        val reader = new BufferedReader(new InputStreamReader(s3object.getObjectContent()))
+        val htmlString = Stream.continually(reader.readLine())
+          .takeWhile(word => Option(word).isDefined).mkString("\n")
+        htmlString
+      } catch {
+        case ex: Exception => {
+          try {
+            val s3object: S3Object = s3client
+              .getObject(new GetObjectRequest(project, module + constant.SCAPEGOATHTMLPATH))
+            val reader = new BufferedReader(new InputStreamReader(s3object.getObjectContent()))
+            val htmlString = Stream.continually(reader.readLine())
+              .takeWhile(word => Option(word).isDefined).mkString("\n")
+            htmlString
+          } catch {
+            case ex: Exception => "<h4>Please submit your HTML report</h4>"
+          }
+        }
+      }
+    }
+
+    if (file contains (constant.DELIMITER)) {
+      val project = file.split(constant.DELIMITER)(0)
+      val module = file.split(constant.DELIMITER)(1) + constant.DELIMITER +
+        file.split(constant.DELIMITER)(2) + constant.DELIMITER
+      findScapegoatHTML(project, module)
+    } else {
+      findScapegoatHTML(file, "")
+    }
+  }
+
+  def findScalastyleXmlReport(project: String, module: String): (String) = {
+    try {
+      val s3object: S3Object = s3client
+        .getObject(new GetObjectRequest(project, module + constant.SCALASTYLEXML))
+      val reader = new BufferedReader(new InputStreamReader(s3object.getObjectContent))
+      val xmlString = Stream.continually(reader.readLine())
+        .takeWhile(word => Option(word).isDefined).mkString("\n")
+      xmlString
+    } catch {
+      case ex: Exception => ex + "exception found"
+    }
+
+  }
+
+  def findLineOfCodes(version: String, file: String): String = {
+
+    def findLines(project: String, module: String): String = {
+      try {
+        val s3object: S3Object = s3client.getObject(new GetObjectRequest(
+          project,
+          module + constant.TARGET + constant.STATS
+        ))
+        val locXml = Source.fromInputStream(s3object.getObjectContent).getLines().toList
+        val numPattern = constant.REGEXP.r
+        val index = locXml.length - 2
+        val regexedString = numPattern.findFirstIn(locXml(index))
+
+        regexedString match {
+          case Some(lines) => lines
+          case None => constant.NA
+        }
+      } catch {
+        case ex: Exception => constant.NA
+      }
+    }
+
+    if (file contains (constant.DELIMITER)) {
+      val project = file.split(constant.DELIMITER)(0)
+      val module = file.split(constant.DELIMITER)(1) + constant.DELIMITER +
+        file.split(constant.DELIMITER)(2) + constant.DELIMITER
+      findLines(project, module)
+    } else {
+      findLines(file, "")
+    }
+  }
+
+  /**
+   * Calculates total number of cpd files in the XML file
+   *
+   * @param version
+   * @param file
+   * @return number of copy paste in the project
+   */
+  def findCopyPasteDetectorReport(version: String, file: String): String = {
+
+    def findCpd(project: String, module: String): String = {
+      try {
+        val s3object: S3Object = s3client
+          .getObject(new GetObjectRequest(project, module + constant.CPDPATH))
+        val cpdXml = load(new InputStreamReader(s3object.getObjectContent))
+        (cpdXml \\ constant.DUPLICATION).length.toString
+      } catch {
+        case exc: SAXParseException => constant.ZERO
+        case ex: Exception => constant.NA
+      }
+    }
+
+    if (file contains (constant.DELIMITER)) {
+      val project = file.split(constant.DELIMITER)(0)
+      val module = file.split(constant.DELIMITER)(1) + constant.DELIMITER +
+        file.split(constant.DELIMITER)(2) + constant.DELIMITER
+      findCpd(project, module)
+    } else {
+      findCpd(file, "")
+    }
+  }
+
+  def findModuleDetails(
+    path: String,
+    elem: String,
+    version: String,
+    projectList: ListBuffer[ProjectInformation],
+    build: String,
+    user: String,
+    projectNamesinDB: List[String]
+  ): ListBuffer[ProjectInformation] = {
+
+    try {
+      if ((elem.split("/")(0) equalsIgnoreCase (user)) ||
+        (user.equalsIgnoreCase("knoldus") && projectNamesinDB.contains(elem.split("/")(0)))) {
+        val listObjectsRequest = new ListObjectsRequest().withBucketName(path).withPrefix(elem)
+          .withDelimiter("/")
+        val objectListing = s3client.listObjects(listObjectsRequest).getCommonPrefixes.asScala
+          .toList
+
+        objectListing.map { module =>
+
+          findModuleDetails(
+            path,
+            module,
+            projectList,
+            Reports(elem.split("/")(0), module.split("/")(1))
+          )
+        }
+      }
+    } catch {
+      case ex: Exception => {
+        Logger.info("Exception occurred while retrieving module details " + ex.printStackTrace())
+      }
+    }
+    projectList
+  }
+
+  def findProjectDetails(user: String, projectNamesinDB: List[String]): List[ProjectInformation] = {
+    Logger.info("Entered findProjectDetails method to get data from S3 " + user)
+    val projectDetails = ConfigUtil.findProjectPathsFromConfig
+    val projectList: ListBuffer[ProjectInformation] = ListBuffer()
+    for (((path, version), build) <- projectDetails) {
+      try {
+        val listProjectRequest = new ListObjectsRequest().withBucketName(path).withPrefix("")
+          .withDelimiter("/")
+        val projectListing = s3client.listObjects(listProjectRequest).getCommonPrefixes.asScala
+          .toList.zipWithIndex
+        val proj = projectListing.filter(_._1 == "Demo-Project/")
+
+        proj map { elem =>
+          val (firstElem, secondElem) = elem
+          Logger.info(s" Element $elem")
+          findModuleDetails(path, firstElem, version, projectList, build, user, projectNamesinDB)
+        }
+        Logger.info("Data for " + user + " successfuly retrieved from S3")
+      } catch {
+        case ex: Exception => {
+          Logger.info("Exception occurred while retrieving data from S3 " + ex.printStackTrace())
+        }
+      }
+    }
+    projectList.toList
+  }
+
+  def findScapegoat(project: String, module: String, version: String): (String, String, String) = {
+
+    try {
+      val s3object: S3Object = s3client.getObject(new GetObjectRequest(
+        project,
+        module + constant.TARGET + version + constant.SCAPEGOATPATH.substring(constant.LIMIT)
+      ))
+      val scapegoatXml: Elem = load(new InputStreamReader(s3object.getObjectContent))
+      (CommonUtil.findScapegoatWarnings(scapegoatXml), CommonUtil
+        .findScapegoatError(scapegoatXml), CommonUtil.findScapegoatInfos(scapegoatXml))
+    } catch {
+      case ex: Exception => {
+        try {
+          val s3object: S3Object = s3client.getObject(new GetObjectRequest(
+            project,
+            module + constant.SCAPEGOATPATH
+          ))
+
+          val scapegoatXml: Elem = load(new InputStreamReader(s3object.getObjectContent))
+          (CommonUtil.findScapegoatWarnings(scapegoatXml), CommonUtil
+            .findScapegoatError(scapegoatXml), CommonUtil.findScapegoatInfos(scapegoatXml))
+        } catch {
+
+          case ex: Exception =>
+            (constant.NA, constant.NA, constant.NA)
+        }
+      }
+    }
+  }
+
+  def updateResult(list: List[Result], result: Reports): Reports = {
+    list match {
+      case Nil => result
+      case head :: tail => head match {
+        case ScalaStyleWarningReport(value) => updateResult(
+          tail,
+          result.copy(scalaStyleWarningReport = ScalaStyleWarningReport(value))
+        )
+        case ScalaStyleXmlReport(value) => updateResult(
+          tail,
+          result.copy(scalaStyleXmlReport = ScalaStyleXmlReport(value))
+        )
+        case CopyPasteDetectorReport(value) => updateResult(
+          tail,
+          result.copy(copyPasteDetectorReport = CopyPasteDetectorReport(value))
+        )
+        case ScoverageReport(value) => updateResult(
+          tail,
+          result.copy(scoverageReport = ScoverageReport(value))
+        )
+        case LOCReport(value) => updateResult(tail, result.copy(locReport = LOCReport(value)))
+        case ScapegoatReport(error, warn, info) => updateResult(
+          tail,
+          result.copy(scapegoatReport = ScapegoatReport(error, warn, info))
+        )
+        case ScapegoatHtmlReport(value) => updateResult(
+          tail,
+          result.copy(scapegoatHtmlReport = ScapegoatHtmlReport(value))
+        )
+      }
+    }
+  }
+
+  def findModuleDetails(
+    bucketName: String,
+    module: String,
+    projectList: ListBuffer[ProjectInformation],
+    emptyReport: Reports
+  ): ListBuffer[ProjectInformation] = {
+
+    try {
+      val listObjectsRequest = new ListObjectsRequest().withBucketName(bucketName)
+        .withPrefix(module)
+      val listOfAllReportsInModules = s3client.listObjects(listObjectsRequest).getObjectSummaries
+        .asScala.map(_.getKey).toList
+      val filePathOfSingleFile = listOfAllReportsInModules.head
+      val s3object: S3Object = s3client
+        .getObject(new GetObjectRequest(bucketName, filePathOfSingleFile))
+      val objectSummary = s3object.getObjectMetadata
+      val modifiedDate = StringUtils.fromDate(objectSummary.getLastModified) substring (0, 10)
+      val dateFormat = new SimpleDateFormat("yyyy-MM-dd")
+      val currentDate = dateFormat.format(Calendar.getInstance().getTime)
+      Logger.info("ListOfAllReportsInModules : " + listOfAllReportsInModules)
+      val parserResult: List[Future[List[Result]]] = listOfAllReportsInModules.map { file =>
+        getFileAndCallParser(bucketName, file)
+      }
+
+      val result: Future[List[Result]] = (Future.sequence(parserResult)).map(_.flatten)
+
+      val reportsJson = result.map(value => write(updateResult(value, emptyReport)))
+      projectList += ProjectInformation(module, currentDate, reportsJson)
+      projectList
+    } catch {
+      case ex: Exception => {
+        Logger.info("Exception occurred while retrieving module details " + ex.printStackTrace())
+        projectList
+      }
+    }
+  }
+
+  def getFileAndCallParser(bucketName: String, filePath: String): Future[List[Result]] = {
+
+    val resultantList: List[Future[Option[Result]]] = try {
+      val s3object = s3client.getObject(new GetObjectRequest(bucketName, filePath))
+      val xmlContent = load(new InputStreamReader(s3object.getObjectContent))
+      val parserList = List(ref1, ref2, ref3, ref4)
+      parserList.map(ref => ask(ref, Parse(xmlContent))).map(_.mapTo[Option[Result]])
+
+    } catch {
+      case ex: SAXParseException =>
+        val s3object = s3client.getObject(new GetObjectRequest(bucketName, filePath))
+        val parserList = List(ref7)
+        val content = Source.fromInputStream(s3object.getObjectContent).getLines().toList
+        parserList.map(ref => ask(ref, StringParser(content))).map(_.mapTo[Option[Result]])
+    }
+    val result: Future[List[Result]] = Future.sequence(resultantList).map(_.flatten)
+    result
+  }
+}
+
+object S3Util extends S3Util]]></codefragment>
+  </duplication>
+  <duplication lines="267" tokens="1564">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/DashboardController.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/DashboardController.scala"/>
+    <codefragment><![CDATA[package controllers
+
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import javax.inject.Inject
+
+import dbservice._
+import model.DashboardReports._
+import model.ParsersResponse._
+import org.joda.time.DateTime
+import play.api.Logger
+import play.api.Play.current
+import play.api.i18n.Messages.Implicits._
+import play.api.libs.json.{ Json, Writes }
+import play.api.mvc._
+import util.{ CommonUtil, ConfigUtil, JsonHelper, S3Util }
+
+import scala.collection.mutable.ListBuffer
+
+class DashboardController @Inject() (
+    accountSettingsDbService: AccountSettingsDbService,
+    projectDbService: ProjectDbService, schedulerDbProcess: SchedulerDbProcess
+) extends Controller with Authenticator with JsonHelper {
+
+  val commonUtil: CommonUtil = CommonUtil
+  val s3Util: S3Util = S3Util
+  val configUtil: ConfigUtil = ConfigUtil
+
+  /**
+   * Display dashboard with project detail
+   */
+
+  def dashboard: Action[AnyContent] = Action { implicit request =>
+
+    val username = request.session.get("username")
+    username match {
+      case Some(user) => {
+        val (nameOfProjects, nameOfModule, warning, scapegoatWarnings, scapegoatErrors, scapegoatInfos, scoverageResult, cpdResult, loc,
+          date, diff, color, loginReport, username, userEmail) = extractProjectDetails(user)
+        Ok(views.html.index(nameOfProjects, nameOfModule, warning, scapegoatWarnings, scapegoatErrors,
+          scapegoatInfos, scoverageResult, cpdResult, loc, date,
+          diff, color, loginReport, username, userEmail)).withSession("username" -> user).withHeaders(
+          CACHE_CONTROL -> "no-cache",
+          PRAGMA -> "no-cache",
+          CACHE_CONTROL -> "no-store"
+        ).withDateHeaders(EXPIRES -> DateTime.now())
+      }
+      case None => Redirect("/login").flashing("error" -> "No proper user signed in.")
+    }
+
+  }
+
+  /**
+   *
+   * @return tuple of project details to be used for displaying and refreshing the data
+   */
+  private def extractProjectDetails(user: String) = {
+    val dateFormat = new SimpleDateFormat("yyyy-MM-dd")
+    val currentDate = dateFormat.format(Calendar.getInstance().getTime)
+    val loginReport = commonUtil.loginDetails
+    val dashboardDetails = if (user.equals("knoldus")) projectDbService.getDashboardDetailsforAllProjs
+    else getDashboardDetailsForUser(user)
+    val nameOfProjects = dashboardDetails.map(_.projectName)
+    val nameOfModule = dashboardDetails.map(_.moduleName)
+    val warning = dashboardDetails.map(_.scalaStyle)
+    val scapegoatWarnings = dashboardDetails.map(_.scapegoatWarning)
+    val scapegoatErrors = dashboardDetails.map(_.scapegoatError)
+    val scapegoatInfos = dashboardDetails.map(_.scapegoatInfo)
+    val scoverageResult = dashboardDetails.map(_.scoverage)
+    val cpdResult = dashboardDetails.map(_.cpd)
+    val loc = dashboardDetails.map(_.loc)
+    val date = dashboardDetails.map(_.modifiedDate)
+    val diff = List(currentDate)
+    val color = List("default")
+    val username = user.split("\\n").map(_.trim).toList
+    val userEmail = accountSettingsDbService.showEmail(username.headOption.fold("")(username => username)).split("\\n").map(_.trim).toList
+    (nameOfProjects, nameOfModule, warning, scapegoatWarnings, scapegoatErrors, scapegoatInfos,
+      scoverageResult, cpdResult, loc, date, diff, color, loginReport, username, userEmail)
+  }
+
+  private def getDashboardDetailsForUser(user: String): List[DashboardDetails] = {
+    val listOfProjects = projectDbService.getAllProjsForUser(user)
+    val dashboardDetails: ListBuffer[DashboardDetails] = ListBuffer()
+    for (project <- listOfProjects) {
+      dashboardDetails ++= projectDbService.getDashboardDetailsFromDb(project)
+    }
+    dashboardDetails.toList
+  }
+
+  def newDashboard(username: String): Action[AnyContent] = Action { implicit request =>
+
+    val reportsJson: List[String] = extractProjectDetail(username)
+    val reports: List[Reports] = reportsJson.map { value => parse(value).extractOpt[Reports]
+    }.flatten
+
+    val data: List[DashBoardResult] = (reports.groupBy(_.projectName).map(value => DashBoardResult(value._1, (value._2).map(info => ModulesReport(info.moduleName, info))))).toList
+
+    Ok(write(data)).as("application/json")
+  }
+
+  //our
+  private def extractProjectDetail(user: String) = {
+    val dashboardDetails = if (user.equals("knoldus")) {
+      projectDbService.getDashboardDetailsForAllProjs
+    } else {
+      getDashboardDetailsforUser(user)
+    }
+    dashboardDetails.map(_.data)
+  }
+
+  //Our
+  private def getDashboardDetailsforUser(user: String): List[NewDashboardDetails] = {
+    val listOfProjects = projectDbService.getAllProjsForUser(user)
+    val dashboardDetails: ListBuffer[NewDashboardDetails] = ListBuffer()
+    for (project <- listOfProjects) {
+      dashboardDetails ++= projectDbService.getDashboardDetailsFromDatabase(project)
+    }
+    dashboardDetails.toList
+  }
+
+  def forceBuildByProjectName(projectName: String): Action[AnyContent] = withAjaxRequest { implicit request =>
+    request.session.get("username") match {
+      case Some(currentUser) => schedulerDbProcess.getAndStoreDataFromS3(projectName).fold {
+        Logger.info("<<< Data Inserted on Force Build >>>" + new DateTime())
+        val (nameOfProjects, nameOfModule, warning, scapegoatWarnings, scapegoatErrors, scapegoatInfos, scoverageResult, cpdResult, loc,
+          date, diff, color, loginReport, username, userEmail) = extractProjectDetailsOnForceBuild(currentUser, projectName)
+
+        val forceBuildData = List(nameOfProjects, nameOfModule, warning, scapegoatWarnings, scapegoatErrors, scapegoatInfos,
+          scoverageResult, cpdResult, loc, date, diff, color, loginReport, username, userEmail)
+        Ok(Json.toJson(forceBuildData))
+      }(message => BadRequest(Json.obj("message" -> message)))
+      case None => Redirect("/login").flashing("error" -> "No proper user signed in.")
+    }
+  }
+
+  private def extractProjectDetailsOnForceBuild(user: String, projectName: String) = {
+    val dateFormat = new SimpleDateFormat("yyyy-MM-dd")
+    val currentDate = dateFormat.format(Calendar.getInstance().getTime)
+    val loginReport = commonUtil.loginDetails
+    val dashboardDetails = if (user.equals("knoldus")) projectDbService.getDashboardDetailsforAllProjs
+    else getDashboardDetailsForUser(user)
+    val nameOfProjects = dashboardDetails.filter(
+      extractProjectName => extractProjectName.projectName.equalsIgnoreCase(projectName)
+    ).map(_.projectName)
+    val nameOfModule = dashboardDetails.filter(
+      extractProjectName => extractProjectName.projectName.equalsIgnoreCase(projectName)
+    ).map(_.moduleName)
+    val warning = dashboardDetails.filter(
+      extractProjectName => extractProjectName.projectName.equalsIgnoreCase(projectName)
+    ).map(_.scalaStyle)
+    val scapegoatWarnings = dashboardDetails.filter(
+      extractProjectName => extractProjectName.projectName.equalsIgnoreCase(projectName)
+    ).map(_.scapegoatWarning)
+    val scapegoatErrors = dashboardDetails.filter(
+      extractProjectName => extractProjectName.projectName.equalsIgnoreCase(projectName)
+    ).map(_.scapegoatError)
+    val scapegoatInfos = dashboardDetails.filter(
+      extractProjectName => extractProjectName.projectName.equalsIgnoreCase(projectName)
+    ).map(_.scapegoatInfo)
+    val scoverageResult = dashboardDetails.filter(
+      extractProjectName => extractProjectName.projectName.equalsIgnoreCase(projectName)
+    ).map(_.scoverage)
+    val cpdResult = dashboardDetails.filter(
+      extractProjectName => extractProjectName.projectName.equalsIgnoreCase(projectName)
+    ).map(_.cpd)
+    val loc = dashboardDetails.filter(
+      extractProjectName => extractProjectName.projectName.equalsIgnoreCase(projectName)
+    ).map(_.loc)
+    val date = dashboardDetails.filter(
+      extractProjectName => extractProjectName.projectName.equalsIgnoreCase(projectName)
+    ).map(_.modifiedDate)
+    val diff = List(currentDate)
+    val color = List("default")
+    val username = user.split("\\n").map(_.trim).toList
+    val userEmail = accountSettingsDbService.showEmail(username.headOption.fold("")(username => username)).split("\\n").map(_.trim).toList
+    (nameOfProjects, nameOfModule, warning, scapegoatWarnings, scapegoatErrors, scapegoatInfos,
+      scoverageResult, cpdResult, loc, date, diff, color, loginReport, username, userEmail)
+  }
+
+  def getProjectSpecificDetails(project: String): Action[AnyContent] = Action { implicit request =>
+
+    val projectSpecificDetails = projectDbService.getDashboardDetailsFromDb(project)
+    val projectName = projectSpecificDetails.map(_.projectName)
+    val moduleName = projectSpecificDetails.map(_.moduleName)
+    val scalaStyle = projectSpecificDetails.map(_.scalaStyle)
+    val scapegoatWarning = projectSpecificDetails.map(_.scapegoatWarning)
+    val scapegoatError = projectSpecificDetails.map(_.scapegoatError)
+    val scapegoatInfo = projectSpecificDetails.map(_.scapegoatInfo)
+    val scoverage = projectSpecificDetails.map(_.scoverage)
+    val cpd = projectSpecificDetails.map(_.cpd)
+    val loc = projectSpecificDetails.map(_.loc)
+    val modifiedDate = projectSpecificDetails.map(_.modifiedDate)
+    /*implicit val dashboardDetailWrites = new Writes[DashboardDetails] {
+      def writes(pd: DashboardDetails) = Json.obj(
+        "project_name" -> pd.projectName,
+        "module_name" -> pd.moduleName,
+        "scala_style" -> pd.scalaStyle,
+        "scapegoat_warning" -> pd.scapegoatWarning,
+        "scapegoat_error" -> pd.scapegoatError,
+        "scapegoat_info" -> pd.scapegoatInfo,
+        "scoverage" -> pd.scoverage,
+        "cpd" -> pd.cpd,
+        "loc" -> pd.loc,
+        "modified_date" -> pd.modifiedDate
+      )
+    }
+    Ok(Json.toJson(projectSpecificDetails))*/
+    Ok(views.html.projectSpecificDetails(projectName, moduleName, scalaStyle, scapegoatWarning, scapegoatError, scapegoatInfo, scoverage, cpd, loc, modifiedDate))
+  }
+
+  def getScapeGoatReport(project: String, module: String): Action[AnyContent] = Action { implicit request =>
+
+    val scapegoatList = projectDbService.getScapeGoatReport(
+      project,
+      module
+    )
+    Ok(scapegoatList)
+  }
+
+  def getScalaStyleReport(project: String, module: String): Action[AnyContent] = Action { implicit request =>
+
+    val scalaStyleList = projectDbService.getScalaStyleReport(
+      project,
+      module
+    )
+    Ok(scalaStyleList)
+  }
+
+  def getAllDetails(project: String, module: String, duration: String): Action[AnyContent] = withAjaxRequest { implicit request =>
+
+    val projectDetailList = projectDbService.getAllDetails(
+      project,
+      module,
+      duration
+    )
+    implicit val projectDetailWrites = new Writes[ProjectDetails] {
+      def writes(pd: ProjectDetails) = Json.obj(
+        "scala_style" -> pd.scalaStyle,
+        "scapegoat_warning" -> pd.scapegoatWarning,
+        "scapegoat_error" -> pd.scapegoatError,
+        "scapegoat_info" -> pd.scapegoatInfo,
+        "cpd" -> pd.cpd,
+        "scoverage" -> pd.scoverage,
+        "time_stamp" -> pd.timeStamp
+      )
+    }
+    Ok(Json.toJson(projectDetailList))
+
+  }
+
+  def getProjectName(user: String): Action[AnyContent] = Action { implicit request =>
+    val username = request.session.get("username")
+    username match {
+      case Some(user) => {
+        Ok(Json.obj("projectNames" -> projectDbService.getAllProjsForUser(username.fold("")(username => username))))
+          .withSession("username" -> user).withHeaders(
+            CACHE_CONTROL -> "no-cache",
+            PRAGMA -> "no-cache",
+            CACHE_CONTROL -> "no-store"
+          ).withDateHeaders(EXPIRES -> DateTime.now())
+      }
+      case None => Redirect("/login").flashing("error" -> "No proper user signed in.")
+    }
+
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="222" tokens="1371">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/AccountSettingsController.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/AccountSettingsController.scala"/>
+    <codefragment><![CDATA[package controllers
+
+import java.util.UUID
+
+import com.google.inject.Inject
+import dbservice.{ AccountSettingsDbService, PasswordLinksDbService, ProjectDbService }
+import model.AccountSettings.UpdatePassword
+import org.joda.time.DateTime
+import play.api.Logger
+import play.api.Play.current
+import play.api.data.Form
+import play.api.data.Forms._
+import play.api.i18n.Messages.Implicits._
+import play.api.libs.json.Json
+import play.api.mvc.{ Action, AnyContent, Controller }
+import util.CommonUtil
+import util.Constant.{ CHANGE_PASSWORD_LINK, ErrorMessages, PASSWORD_LINK_MAIL_SUBJECT, SuccessMessage }
+
+class AccountSettingsController @Inject() (accountSettingsDbService: AccountSettingsDbService, projectDbService: ProjectDbService,
+    passwordLinksDbService: PasswordLinksDbService, utilities: CommonUtil) extends Controller with Authenticator {
+
+  val commonUtil: CommonUtil = CommonUtil
+
+  val updatePasswordForm = Form(
+    mapping(
+      "oldpassword" -> nonEmptyText,
+      "newpassword" -> nonEmptyText,
+      "confirmpassword" -> nonEmptyText
+    )(UpdatePassword.apply)(UpdatePassword.unapply)
+  )
+
+  val forgotPasswordVerificationForm = Form(
+    single(
+      "email" -> email
+    )
+  )
+
+  val resetPasswordForm = Form(
+    tuple(
+      "id" -> nonEmptyText,
+      "newPassword" -> text,
+      "confirmPassword" -> text
+    )
+  )
+
+  def showForgotPasswordVerificationForm: Action[AnyContent] = Action { implicit request =>
+    request.session.get("username") match {
+      case Some(user) => loadDashboardPage(user)
+      case None => Ok(views.html.forgotPasswordEmailVerification(forgotPasswordVerificationForm))
+    }
+  }
+
+  def sendChangePasswordLink: Action[AnyContent] = Action { implicit request =>
+    forgotPasswordVerificationForm.bindFromRequest.fold(
+      errorForm => BadRequest(views.html.forgotPasswordEmailVerification(errorForm)),
+      email =>
+        accountSettingsDbService.isEmailExist(email).fold {
+          Redirect("/forgotPassword/verification").flashing("error" -> ErrorMessages.emailNotFoundError.format(email))
+        } { username =>
+          val uniqueId = UUID.randomUUID().toString
+          val template = views.html.mailTemplates.forgotPassword(username, CHANGE_PASSWORD_LINK.format(request.host, uniqueId)).toString()
+          passwordLinksDbService.insertLink(uniqueId, email)
+          utilities.sendEmail(email, PASSWORD_LINK_MAIL_SUBJECT, template)
+          Logger.info("---- " + SuccessMessage.passwordUpdateSentMessage.format(email))
+          Redirect("/forgotPassword/verification").flashing("success" -> SuccessMessage.passwordUpdateSentMessage.format(email))
+        }
+    )
+  }
+
+  def setNewPassword: Action[AnyContent] = Action { implicit request =>
+    request.getQueryString("id") match {
+      case Some(id) => passwordLinksDbService.getLink(id).headOption.fold(Ok(views.html.error())) { link =>
+        val (linkId, emailId, isExpired) = link
+        if (isExpired == "true") Ok(views.html.error())
+        else Ok(views.html.resetPassword(resetPasswordForm.fill((id, "", ""))))
+      }
+      case None => Ok(views.html.error())
+    }
+  }
+
+  def showEmail: Action[AnyContent] = withAjaxRequest { implicit request =>
+    val username = request.session.get("username")
+    username match {
+      case Some(user) => {
+        val userEmail = accountSettingsDbService.showEmail(username.fold("")(username => username))
+        Ok(views.html.email(userEmail)).withSession("username" -> user).withHeaders(
+          CACHE_CONTROL -> "no-cache",
+          PRAGMA -> "no-cache",
+          CACHE_CONTROL -> "no-store"
+        ).withDateHeaders(EXPIRES -> DateTime.now())
+      }
+      case None => Redirect("/login").flashing("error" -> "No proper user signed in.")
+    }
+  }
+
+  def changeEmail(email: String): Action[AnyContent] = Action { implicit request =>
+    Logger.info("email" + email)
+    val username = request.session.get("username")
+    username match {
+      case Some(user) => {
+        accountSettingsDbService.changeEmail(username.fold("")(username => username), email)
+        Ok(Json.obj("message" -> SuccessMessage.changeEmailSuccess, "email" -> accountSettingsDbService.showEmail(username.fold("")(username => username))))
+          .withSession("username" -> user).withHeaders(
+            CACHE_CONTROL -> "no-cache",
+            PRAGMA -> "no-cache",
+            CACHE_CONTROL -> "no-store"
+          ).withDateHeaders(EXPIRES -> DateTime.now())
+      }
+      case None => Redirect("/login").flashing("error" -> "No proper user signed in.")
+    }
+
+  }
+
+  def editProfile: Action[AnyContent] = Action { implicit request =>
+    val username = request.session.get("username")
+    Logger.info("Edit profile page")
+    username match {
+      case Some(user) => {
+        val userEmail = accountSettingsDbService.showEmail(username.headOption.fold("")(username => username))
+        val projectListForUser = projectDbService.getProjectDetailsForNewUser(username.fold("")(user => user))
+        Logger.info(projectListForUser.toString())
+        Ok(views.html.editProfile(projectListForUser, user, userEmail)).withSession("username" -> user).withHeaders(
+          CACHE_CONTROL -> "no-cache",
+          PRAGMA -> "no-cache",
+          CACHE_CONTROL -> "no-store"
+        ).withDateHeaders(EXPIRES -> DateTime.now())
+
+      }
+      case None => Redirect("/login").flashing("error" -> "No proper user signed in.")
+    }
+
+  }
+
+  def updatePasswordPage: Action[AnyContent] = withAjaxRequest { implicit request =>
+
+    val username = request.session.get("username")
+    username match {
+      case Some(user) => {
+        Ok(views.html.password(updatePasswordForm)).withSession("username" -> user).withHeaders(
+          CACHE_CONTROL -> "no-cache",
+          PRAGMA -> "no-cache",
+          CACHE_CONTROL -> "no-store"
+        ).withDateHeaders(EXPIRES -> DateTime.now())
+      }
+      case None => Redirect("/login").flashing("error" -> "No proper user signed in.")
+    }
+  }
+
+  def resetPassword: Action[AnyContent] = Action { implicit request =>
+    resetPasswordForm.bindFromRequest.fold(
+      errorForm => BadRequest(views.html.resetPassword(errorForm)),
+      passwordDetails => {
+        val (id, newPassword, confirmPassword) = passwordDetails
+        passwordLinksDbService.getLink(id).headOption match {
+          case Some((linkId, emailId, isExpired)) =>
+            accountSettingsDbService.updatePasswordByEmail(emailId, newPassword)
+            passwordLinksDbService.destroyLink(linkId)
+            loadDashboardPage(accountSettingsDbService.getUsername(emailId))
+          case None => Ok(views.html.error())
+        }
+      }
+    )
+  }
+
+  private def loadDashboardPage(user: String, errorMessage: Option[String] = None)(implicit request: play.api.mvc.RequestHeader) = {
+    val projectName = projectDbService.getProjectDetailsForNewUser(user).map { project =>
+      val (projectName, isAdmin) = project
+      projectName
+    }.distinct
+    val projectNameFromDashboard = projectDbService.getProjectNamesFromDashboardDetails.distinct
+    val projectExists = projectName.intersect(projectNameFromDashboard)
+    Logger.info(projectName.toString() + "\n" + projectNameFromDashboard.toString() + "\n" + projectExists.toString())
+
+    if (projectDbService.getProjectDetailsForNewUser(user).isEmpty) sessionWithoutCookies("/welcome-user", user)
+    else if (projectExists.isEmpty) sessionWithoutCookies("/help", user)
+    else sessionWithoutCookies("/dashboard", user)
+  }
+
+  private def sessionWithoutCookies(url: String, user: String)(implicit request: play.api.mvc.RequestHeader) = {
+    Redirect(url).withSession("username" -> user).withHeaders(
+      CACHE_CONTROL -> "no-cache",
+      PRAGMA -> "no-cache",
+      CACHE_CONTROL -> "no-store"
+    ).withDateHeaders(EXPIRES -> DateTime.now())
+  }
+
+  def updateUserPassword(newpassword: String): Action[AnyContent] = withAjaxRequest { implicit request =>
+    val username = request.session.get("username")
+    username match {
+      case Some(user) => {
+        accountSettingsDbService.updateUserPassword(user, newpassword)
+        Ok(Json.obj("message" -> "Password was updated successfully"))
+      }
+      case None => Redirect("/login").flashing("error" -> "No proper user signed in.")
+    }
+  }
+
+  def getPassword(oldpassword: String): Action[AnyContent] = Action { implicit request =>
+    val username = request.session.get("username")
+    val encryptedPassword = (commonUtil.md5(Some(oldpassword))).fold("")(userPassword => userPassword)
+    val passwordsRetrievedFromDb = accountSettingsDbService.getPassword(username.fold("")(user => user), encryptedPassword)
+    val isExist = if (passwordsRetrievedFromDb.length != 0) false else true
+
+    if (isExist) {
+      Ok("false")
+    } else {
+      Ok("true")
+    }
+  }
+
+  def getEmail(newemail: String): Action[AnyContent] = Action { implicit request =>
+    val userEmail = accountSettingsDbService.getEmail(newemail)
+    val isExist = if (userEmail.length != 0) true else false
+
+    if (isExist) {
+      Ok("false")
+    } else {
+      Ok("true")
+    }
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="238" tokens="1363">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/SchedulerDbProcess.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/SchedulerDbProcess.scala"/>
+    <codefragment><![CDATA[package dbservice
+
+import java.text.SimpleDateFormat
+import java.util.{ Date, TimeZone }
+
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.util.control.Exception.allCatch
+import scala.util.{ Failure, Success }
+
+import com.google.inject.Inject
+import model.DashboardReports.ProjectDetails
+import org.joda.time.DateTime
+import play.api.Logger
+import util.Constant.ErrorMessages
+import util._
+
+/**
+ * Created by knoldus on 28/7/16.
+ */
+class SchedulerDbProcess @Inject() (
+    projectDbService: ProjectDbService,
+    collaboratorDbService: CollaboratorDbService,
+    accountSettingsDbService: AccountSettingsDbService,
+    utilities: CommonUtil
+) {
+  val schedulerInterval = ConfigUtil.findSchedulerIntervalFromConfig
+
+  def getAndStoreDataFromS3(projectName: String): Option[String] = {
+    val projectNamesinDB = projectDbService.getAllProjectNames()
+    val projectData: List[ProjectInformation] = S3Util
+      .findProjectDetails(projectName, projectNamesinDB)
+    if (projectData.isEmpty) {
+      Logger.info(ErrorMessages.projectNotFoundError.format(projectName))
+      Some(ErrorMessages.projectNotFoundError.format(projectName))
+    } else {
+      projectData.map { projectInfo =>
+        projectInfo.data onComplete {
+          case Success(value) => insertReportsInDB(
+            projectInfo.completeNameOfProject.split("/")(0),
+            projectInfo.completeNameOfProject.split("/")(1),
+            projectInfo.date,
+            value
+          )
+          case Failure(ex) =>
+            Logger
+              .info("Faild in parsing files ====" + ex.printStackTrace()); None
+        }
+      }
+      None
+    }
+  }
+
+  private def insertReportsInDB(
+    projectName: String,
+    moduleName: String,
+    date: String,
+    reportsJson: String
+  ): Option[String] = {
+    try {
+      projectDbService.insertData(projectName, moduleName, reportsJson, date)
+      None
+    } catch {
+      case ex: Exception =>
+        Logger
+          .info("Exception occurred when inserting Reports:" + ex.printStackTrace()); None
+    }
+  }
+
+  def sendDailyNotification: Unit = {
+    val userProjectList = projectDbService.getUserProject
+    Logger.info(userProjectList.toString() + "???????")
+    sendDailyProjectStatus(userProjectList)
+  }
+
+  private def sendDailyProjectStatus(projectsPerUser: List[(String, String)]) = {
+    projectsPerUser map { projectByUserDetails =>
+      val (username, projectName) = projectByUserDetails
+      val emailId = accountSettingsDbService.showEmail(username)
+      Logger.info(emailId + "*******************************************")
+      val modules = projectDbService.getModuleFromProjectName(projectName)
+      val comparedModuleDetails: Map[String, List[(Option[Double], Option[Double], String)]] =
+        modules
+          .foldLeft(Map.empty[String, List[(Option[Double], Option[Double], String)]]) {
+            (moduleDetails, moduleName) =>
+              Logger.info(moduleName + "//////////////////////////////////////")
+              val allDetailsToday: List[ProjectDetails] = projectDbService
+                .getAllDetails(projectName, moduleName, "0")
+              val allDetailsYesterday: List[ProjectDetails] = (projectDbService
+                .getAllDetails(projectName, moduleName, "1"))
+                .headOption.fold(Nil: List[ProjectDetails])(record => List(record))
+              val combinedReport = allDetailsToday.indices
+                .foldLeft(Nil: List[(Option[Double], Option[Double], String)]) {
+                  (report, index) =>
+                    val (yesterValueSS, todayValueSS) = ((allDetailsYesterday)(index)
+                      .scalaStyle, (allDetailsToday)(index).scalaStyle)
+                    val (yesterValueSGE, todayValueSGE) = ((allDetailsYesterday)(index)
+                      .scapegoatError, (allDetailsToday)(index).scapegoatError)
+                    val (yesterValueSGI, todayValueSGI) = ((allDetailsYesterday)(index)
+                      .scapegoatInfo, (allDetailsToday)(index).scapegoatInfo)
+                    val (yesterValueSGW, todayValueSGW) = ((allDetailsYesterday)(index)
+                      .scapegoatWarning, (allDetailsToday)(index).scapegoatWarning)
+                    val (yesterValueSC, todayValueSC) = ((allDetailsYesterday)(index)
+                      .scoverage, (allDetailsToday)(index).scoverage)
+                    val (yesterValueCPD, todayValueCPD) = ((allDetailsYesterday)(index)
+                      .cpd, (allDetailsToday)(index).cpd)
+                    report :+ (convertStringToDouble(todayValueSS), changeInValues(
+                      yesterValueSS,
+                      todayValueSS
+                    ), "Scalastyle") :+
+                      (convertStringToDouble(todayValueSC), changeInValues(
+                        yesterValueSC,
+                        todayValueSC
+                      ), "SCoverage") :+
+                      (convertStringToDouble(todayValueCPD), changeInValues(
+                        yesterValueCPD,
+                        todayValueCPD
+                      ), "CPD") :+
+                      (convertStringToDouble(todayValueSGI), changeInValues(
+                        yesterValueSGI,
+                        todayValueSGI
+                      ), "Info") :+
+                      (convertStringToDouble(todayValueSGW), changeInValues(
+                        yesterValueSGW,
+                        todayValueSGW
+                      ), "Warning") :+
+                      (convertStringToDouble(todayValueSGE), changeInValues(
+                        yesterValueSGE,
+                        todayValueSGE
+                      ), "Error")
+                }
+              val detailsByModule = Map(moduleName -> combinedReport)
+              moduleDetails ++ detailsByModule
+          }
+      try {
+        Logger.info(comparedModuleDetails.toString())
+        if (comparedModuleDetails.size > 0) {
+          val modifiedDate = projectDbService.getModifiedDate(projectName)
+          Logger
+            .info("||||||||||||||||||||||||" + modifiedDate.toString() +
+              "*******************************")
+          utilities
+            .sendEmail(
+              emailId,
+              s"CodeSquad Project Status : $projectName",
+              views.html.mailTemplates.notificationMail(username, projectName,
+                comparedModuleDetails, modifiedDate).toString()
+            )
+          Logger
+            .info(s"---- Project Status mail for project $projectName sent to $username on " +
+              s"$emailId successfully ----- ")
+        }
+      } catch {
+        case ex => Logger
+          .info(s"---- Project Status mail for project $projectName failed to send to $username " +
+            s"on $emailId ----- ")
+      }
+    }
+  }
+
+  private def changeInValues(yesterday: String, today: String): Option[Double] = {
+    for (
+      todayValue <- convertStringToDouble(today);
+      yesterdayValue <- convertStringToDouble(yesterday)
+    ) yield {
+      todayValue - yesterdayValue
+    }
+  }
+
+  private def convertStringToDouble(values: String): Option[Double] = allCatch opt values.toDouble
+
+  def calculateInitialDelay(): Long = {
+    val now = new Date()
+    val sdf = new SimpleDateFormat("HH:mm:ss")
+    sdf.setTimeZone(TimeZone.getTimeZone("IST"))
+    val time1 = sdf.format(now)
+    val time2 = Constant.mailerTime
+    val format = new SimpleDateFormat("HH:mm:ss")
+    val date1 = format.parse(time1)
+    val date2 = format.parse(time2)
+    val timeDifference = date2.getTime() - date1.getTime()
+    Logger
+      .info(timeDifference + "timedifference" + "}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}")
+    val calculatedTime = if (timeDifference < 0) {
+      (Constant.DAYHOURS +
+        timeDifference)
+    } else {
+      timeDifference
+    }
+    Logger.info("calculated time ======================" + calculatedTime)
+    calculatedTime
+  }
+
+  private def insertProjectData(projectData: List[Project], projectName: String): Option[String] = {
+    try {
+      for (project <- projectData) {
+        projectDbService
+          .insert(
+            project.name.split("/")(1),
+            project.name.split("/")(2),
+            project.warning,
+            project.scapegoatWarning,
+            project.scapegoatInfo,
+            project.scapegoatError,
+            project.sCoverage,
+            project.cpd,
+            project.loc,
+            project.date
+          )
+      }
+      Logger.info(">> Data Inserted for user >>" + projectName + new DateTime())
+      None
+    } catch {
+      case ex: Exception =>
+        Logger
+          .info("Exception found schedulerDbProcess:" + ex.printStackTrace()); None
+    }
+  }
+
+  private def insertReports(projectData: List[Project], projectName: String): Option[String] = {
+    try {
+      for (project <- projectData) {
+        projectDbService
+          .insertReports(
+            project.name.split("/")(1),
+            project.name.split("/")(2),
+            project.scalastyleXmlReport,
+            project.scapegoatHtmlReport
+          )
+      }
+      Logger.info(">> Reports Inserted for user >>" + projectName + new DateTime())
+      None
+    } catch {
+      case ex: Exception =>
+        Logger
+          .info("Exception found schedulerDbProcess:" + ex.printStackTrace()); None
+    }
+  }
+}]]></codefragment>
+  </duplication>
+  <duplication lines="184" tokens="1335">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/LoginController.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/LoginController.scala"/>
+    <codefragment><![CDATA[package controllers
+
+import com.google.inject.Inject
+import dbservice.{ CollaboratorDbService, LinksDbService, ProjectDbService }
+import model.Collaborator.LinkDetail
+import model.Login._
+import org.joda.time.DateTime
+import play.api.Logger
+import play.api.Play.current
+import play.api.data.Form
+import play.api.data.Forms._
+import play.api.i18n.Messages.Implicits._
+import play.api.mvc.{ Action, AnyContent, _ }
+import util.Constant.{ EMPTY, ErrorMessages }
+import util.LoginUtil
+
+class LoginController @Inject() (loginUtil: LoginUtil, projectDbService: ProjectDbService, collaboratorService: CollaboratorDbService,
+    linksDbService: LinksDbService) extends Controller {
+
+  val loginForm = Form(
+    mapping(
+      "username" -> nonEmptyText,
+      "password" -> nonEmptyText,
+      "linkId" -> optional(text)
+    )(LoginForm.apply)(LoginForm.unapply)
+  )
+
+  def login: Action[AnyContent] = Action { implicit request =>
+    val sessionUser = request.session.get("username")
+    request.getQueryString("id") match {
+      case Some(linkId) =>
+        val links = linksDbService.getLink(linkId): List[LinkDetail]
+        if (!links.exists(link => !(link.is_expired == "true"))) Ok(views.html.error())
+        else {
+          sessionUser match {
+            case Some(username) => links.headOption match {
+              case Some(link) => if (authenticateUserByEmailAndUsername(username, link.username)) {
+                processInvitationForLoggedInUser(sessionUser, linkId, links)
+              } else loadDashboardPage(username, Some(ErrorMessages.sessionExistError.format(username.capitalize)))
+              case None => Ok(views.html.error())
+            }
+            case None => processInvitationForLoggedInUser(sessionUser, linkId, links)
+          }
+        }
+      case None => sessionUser.fold(renderLoginPage)(user => loadDashboardPage(user))
+    }
+  }
+
+  private def processInvitationForLoggedInUser(sessionUser: Option[String], linkId: String,
+    links: List[LinkDetail])(implicit request: play.api.mvc.RequestHeader) = {
+    links.headOption match {
+      case Some(linkDetails) =>
+        val (invitedUser, projectName) = (linkDetails.username, linkDetails.project_name)
+        sessionUser.fold(Ok(views.html.login(loginForm.fill(LoginForm(EMPTY, EMPTY, Some(linkId))))).withDateHeaders(EXPIRES -> DateTime.now())) {
+          user => authenticateLoginUserAndInvitee(user, invitedUser, projectName, linkId, ErrorMessages.invalidUserLogIn.format(invitedUser.capitalize))
+        }
+      case None =>
+        Logger.info(s"--- Link details not found in records with id : $linkId---")
+        renderLoginPage
+    }
+  }
+
+  def index: Action[AnyContent] = Action { implicit request =>
+    loginForm.bindFromRequest.fold(
+      errorForm => BadRequest(views.html.login(errorForm)).flashing("error" -> "Please enter the credentials to login"),
+      success => {
+        val user = loginUtil.authenticateUser(success.usernameOrEmail, Some(success.password))
+        Logger.info("=================" + user + "=======================")
+        if (user != "fail") {
+          Logger.info("--- User Logged in " + user + " " + new DateTime())
+          success.linkId match {
+            case Some(linkId) => validateUserForActivationProcess(linkId, user)
+            case None => loadDashboardPage(user)
+          }
+        } else {
+          success.linkId.fold(Redirect("/login"))(invitationId => Redirect(s"/login?id=$invitationId"))
+            .flashing("error" -> "Either username or password was incorrect")
+        }
+      }
+    )
+  }
+
+  private def validateUserForActivationProcess(linkId: String, user: String)(implicit request: play.api.mvc.RequestHeader) = {
+    val links = linksDbService.getLink(linkId): List[LinkDetail]
+    if (!links.exists(link => !(link.is_expired == "true"))) loadDashboardPage(user)
+    else {
+      links.headOption match {
+        case Some(linkDetails) =>
+          val (invitedUser, projectName) = (linkDetails.username, linkDetails.project_name)
+          authenticateLoginUserAndInvitee(user, invitedUser, projectName, linkId, ErrorMessages.invalidInvitee)
+        case None =>
+          Logger.info(s"--- Link details not found in records with id : $linkId---")
+          loadDashboardPage(user)
+      }
+    }
+  }
+
+  private def authenticateLoginUserAndInvitee(user: String, invitedUser: String, projectName: String, linkId: String,
+    errorMessage: String)(implicit request: play.api.mvc.RequestHeader) = {
+    if (authenticateUserByEmailAndUsername(user, invitedUser)) processActivationLink(invitedUser, projectName, Some(user), linkId)
+    else Ok(views.html.login(loginForm)).withDateHeaders(EXPIRES -> DateTime.now()).flashing("error" -> errorMessage)
+  }
+
+  private def authenticateUserByEmailAndUsername(user: String, invitedUser: String) = {
+    if (user.equalsIgnoreCase(invitedUser)) true
+    else {
+      collaboratorService.getUsernameByEmail(user) match {
+        case Some(username) => username.equalsIgnoreCase(invitedUser)
+        case None => false
+      }
+    }
+  }
+
+  private def loadDashboardPage(user: String, errorMessage: Option[String] = None)(implicit request: play.api.mvc.RequestHeader) = {
+    val projectName = projectDbService.getProjectDetailsForNewUser(user).map { project =>
+      val (projectName, isAdmin) = project
+      projectName
+    }.distinct
+    val projectNameFromDashboard = projectDbService.getProjectNamesFromDashboardDetails.distinct
+    val projectExists = projectName.intersect(projectNameFromDashboard)
+    Logger.info(projectName.toString() + "\n" + projectNameFromDashboard.toString() + "\n" + projectExists.toString())
+
+    errorMessage match {
+      case Some(error) =>
+        request.getQueryString("id") match {
+          case Some(invitationId) =>
+            if (projectDbService.getProjectDetailsForNewUser(user).isEmpty) sessionWithCookies("/welcome-user", invitationId, user, error, "addProjectError")
+            else if (projectExists.isEmpty) sessionWithCookies("/help", invitationId, user, error, "error")
+            else sessionWithCookies("/dashboard", invitationId, user, error, "error")
+
+          case None =>
+            if (projectDbService.getProjectDetailsForNewUser(user).isEmpty) sessionWithoutCookies("/welcome-user", user)
+            else if (projectExists.isEmpty) sessionWithoutCookies("/help", user)
+            else sessionWithoutCookies("/dashboard", user)
+        }
+
+      case None =>
+        if (projectDbService.getProjectDetailsForNewUser(user).isEmpty) sessionWithoutCookies("/welcome-user", user)
+        else if (projectExists.isEmpty) sessionWithoutCookies("/help", user)
+        else sessionWithoutCookies("/dashboard", user)
+    }
+  }
+
+  private def sessionWithCookies(url: String, invitationId: String, user: String, error: String,
+    errorKey: String)(implicit request: play.api.mvc.RequestHeader) = {
+    Redirect(url).withSession("username" -> user).withHeaders(
+      CACHE_CONTROL -> "no-cache",
+      PRAGMA -> "no-cache",
+      CACHE_CONTROL -> "no-store"
+    ).withDateHeaders(EXPIRES -> DateTime.now()).flashing(errorKey -> error).withCookies(Cookie("invitationId", invitationId))
+  }
+
+  private def sessionWithoutCookies(url: String, user: String)(implicit request: play.api.mvc.RequestHeader) = {
+    Redirect(url).withSession("username" -> user).withHeaders(
+      CACHE_CONTROL -> "no-cache",
+      PRAGMA -> "no-cache",
+      CACHE_CONTROL -> "no-store"
+    ).withDateHeaders(EXPIRES -> DateTime.now())
+  }
+
+  def renderLoginPage()(implicit request: play.api.mvc.RequestHeader): Result = {
+    Ok(views.html.login(loginForm)).withHeaders(
+      CACHE_CONTROL -> "no-cache",
+      PRAGMA -> "no-cache",
+      CACHE_CONTROL -> "no-store"
+    ).withDateHeaders(EXPIRES -> DateTime.now())
+  }
+
+  private def processLogin(sessionUser: Option[String])(implicit request: play.api.mvc.RequestHeader) = {
+    sessionUser match {
+      case Some(user) => sessionWithoutCookies("/dashboard", user)
+      case None => renderLoginPage()
+    }
+  }
+
+  private def processActivationLink(collaboratorUsername: String, projectName: String, sessionUser: Option[String],
+    linkId: String)(implicit request: play.api.mvc.RequestHeader) = {
+    linksDbService.destroyLink(linkId)
+    collaboratorService.createNewCollaborator(collaboratorUsername, projectName).fold(processLogin(sessionUser)) {
+      errorMessage => Ok(views.html.login(loginForm)).withDateHeaders(EXPIRES -> DateTime.now()).flashing("error" -> errorMessage)
+    }
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="129" tokens="1184">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/util/SqlQuery.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/util/SqlQuery.scala"/>
+    <codefragment><![CDATA[package util
+
+//scalastyle:off
+/**
+ * Created by knoldus on 20/8/16.
+ */
+object SqlQuery {
+
+  val INSERT_DASHBOARD_DETAILS = "insert into dashboard_details(project_name,module_name,scala_style,scapegoat_warning,scapegoat_info," +
+    "scapegoat_error,scoverage,cpd,loc,modified_date) " +
+    "values({project_name},{module_name},{scala_style}," +
+    "{scapegoat_warning},{scapegoat_info},{scapegoat_error},{scoverage},{cpd},{loc},{modified_date});"
+
+  val INSERT_XML_HTML_REPORTS = "insert into xml_html_reports(project_name,module_name,scalastyle_xml,scapegoat_html) " +
+    "VALUES({project_name},{module_name},{scalastyle_xml},{scapegoat_html}) " +
+    "on duplicate key update project_name={project_name},module_name={module_name},scalastyle_xml={scalastyle_xml},scapegoat_html={scapegoat_html};"
+
+  val INSERT_REPORTS_JSON = "insert into project_information(project_name,module_name,data,modified_date) VALUES({project_name},{module_name},{data},{modified_date});"
+
+  val GET_GRAPH_DETAILS = "select * from dashboard_details where (project_name={project_name}) and (module_name={module_name})" +
+    "and time_stamp in (select max(time_stamp) from dashboard_details " +
+    " where ((time_stamp>DATE(now()- interval {duration} day)) and (project_name={project_name}) and (module_name={module_name}) ) " +
+    "group by EXTRACT(day from time_stamp), EXTRACT(month from time_stamp));"
+
+  val GET_DASHBOARD_DETAILS_FOR_PROJECT = "select * from dashboard_details where project_name = {projectName} " +
+    " and (project_name, module_name, time_stamp) in ( select project_name, module_name, max(time_stamp) from " +
+    "dashboard_details where project_name = {projectName} group by project_name, module_name);"
+
+  val GET_ALLPROJECT_DETAILS = "select * from dashboard_details where (project_name, module_name, time_stamp) in " +
+    "(select project_name, module_name, max(time_stamp) " +
+    "from dashboard_details group by project_name , module_name);"
+
+  val GET_PROJECT_INFORMATION = "select * from project_information where project_name = {projectName} " +
+    " and (project_name, module_name, time_stamp) in ( select project_name, module_name, max(time_stamp) from " +
+    "project_information where project_name = {projectName} group by project_name, module_name);"
+
+  val GET_ALL_PROJ_DETAILS = "select * from project_information where (project_name, module_name, time_stamp) in " +
+    "(select project_name, module_name, max(time_stamp) " +
+    "from project_information group by project_name , module_name);"
+
+  val GET_SCALASTYLE_REPORT = "select scalastyle_xml from xml_html_reports " +
+    "where project_name={project_name} and module_name={module_name}"
+
+  val GET_SCAPEGOAT_REPORT = "select scapegoat_html from xml_html_reports " +
+    "where project_name={project_name} and module_name={module_name}"
+
+  val ADD_NEW_USER = "insert into user_details(username,password,email_id) " +
+    "values({username},{password},{email_id});"
+
+  val GET_USERNAME = "select username from user_details where username={username};"
+
+  val USER_PASSWORD = "select username,password from user_details"
+
+  val GET_EMAIL_ID = "select email_id from user_details where username = {username}"
+
+  val CHANGE_EMAIL = "update user_details set email_id = {email_id} where username={username};"
+
+  val CHANGE_PASSWORD = "update user_details set password = {password} where username={username};"
+
+  val CHANGE_PASSWORD_BY_EMAIL = "update user_details set password = {password} where email_id={email_id};"
+
+  val INSERT_USER_DETAILS = "insert into project_details(p_name,access_key,secret_key) " +
+    "values({p_name},{access_key},{secret_key});"
+
+  val GET_PROJECTNAME = "select p_name from project_details where p_name={p_name};"
+
+  val INSERT_USER_PROJECT = "insert into user_project(username,project,is_admin) values({username},{project},{is_admin});"
+
+  val PROJECT_DETAILS_NEWUSER = "select * from user_project where username={username};"
+
+  val DELETE_FROM_PROJ_DETAILS = "delete from project_details where p_name={p_name};"
+
+  val DELETE_FROM_USER_PROJECT = "delete from user_project where project={project};"
+
+  val DELETE_FROM_DASHBOARD_DETAILS = "delete from dashboard_details where project_name = {project_name};"
+
+  val GET_ACCESS_KEY = "select access_key,secret_key from project_details where p_name = {p_name};"
+
+  val GET_USER_PROJECT_FORUSER = "select * from user_project where username={username};"
+
+  val GET_PASSWORD = "select * from user_details where username={username} and password={password};"
+
+  val GET_USER_BY_EMAIL = "select username from user_details where email_id={email_id};"
+
+  val GET_PROJECT_NAMES = "select p_name from project_details"
+
+  val DELETE_COLLABORATOR = "DELETE FROM user_project WHERE username = {username} and project = {project};"
+
+  val CHECK_IF_COLLABORATOR_EXISTS = "select count(*) from user_project WHERE username ={username} and project = {project};"
+
+  val GET_COLLABORATORS_BY_PROJECT = "select * from user_project WHERE project={project};"
+
+  val GET_ALL_USERS = "SELECT username FROM user_details;"
+
+  val GET_EMAIL_BYEMAIL = "select email_id from user_details where email_id={email_id};"
+
+  val GET_EMAIL_BY_USERNAME = "select email_id from user_details where username={username};"
+
+  val AUTHENTICATE_USER = "select username from user_details where (email_id={username} or username={username}) and password={password};"
+
+  val INSERT_LINK = "insert into invitation_links(invite_id,username, admin_name, project_name,is_expired) values({invite_id},{username},{admin_name},{project_name},{is_expired});"
+
+  val UPDATE_LINK = "update invitation_links set is_expired = 'true' where invite_id={invite_id};"
+
+  val GET_LINK = "select * from invitation_links where invite_id={invite_id};"
+
+  val IS_LINK_LIMIT_EXPIRED = "select count(*) from invitation_links where admin_name={admin_name} and project_name={project_name} and is_expired = 'false';"
+
+  val GET_NO_OF_PROJECTS_ADDED_BY_USER = "select count(*) from user_project where username = {username} and is_admin = 'Y';"
+
+  val GET_PROJECTS_FOR_USER = "select project from user_project where username = {username};"
+
+  val GET_PROJECT_NAME_FROM_DASHBOARD = "select project_name from dashboard_details;"
+
+  val INSERT_PASSWORD_LINK = "insert into password_links(id,email,is_expired) values({id},{email},{is_expired});"
+
+  val UPDATE_PASSWORD_LINK = "update password_links set is_expired = 'true' where id={id};"
+
+  val GET_PASSWORD_LINK = "select * from password_links where id={id};"
+
+  val GET_PENDING_INVITES = "select invite_id, username from invitation_links where admin_name={admin_name} and project_name={project_name} and is_expired = 'false';"
+
+  val GET_MODULE_NAME_BY_PROJECT = "select module_name from xml_html_reports where project_name = {project_name}"
+
+  val GET_USER_PROJECT = "select username,project from user_project;"
+
+  val GET_MODIFIED_DATE = "select modified_date from dashboard_details where project_name = {project_name}"
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="197" tokens="1020">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/util/CommonUtil.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/util/CommonUtil.scala"/>
+    <codefragment><![CDATA[package util
+
+import java.math.BigInteger
+import java.security.MessageDigest
+import java.util.UUID
+
+import anorm.ParameterMetaData.UUIDParameterMetaData
+import model.Collaborator.Link
+import play.api.Logger
+import util.Constant.{ LOGIN_LINK, LinkType, REGISTRATION_LINK }
+
+import scala.collection.mutable.ListBuffer
+import scala.io.Source
+import scala.language.postfixOps
+import scala.xml.Elem
+import scala.xml.XML._
+import java.io._
+
+import util.Constant._
+import play.api.db.{ DB, Database }
+import play.api.Play.current
+import java.math.BigInteger
+import java.security.{ MessageDigest, NoSuchAlgorithmException }
+import javax.ws.rs.core.MediaType
+
+import com.sun.jersey.api.client.Client
+import com.sun.jersey.api.client.ClientResponse
+import com.sun.jersey.api.client.WebResource
+import com.sun.jersey.api.client.filter.HTTPBasicAuthFilter
+import com.sun.jersey.core.util.MultivaluedMapImpl
+
+import scala.concurrent.Future
+
+/**
+ * This object contains common utility functions to be used across application
+ */
+
+case class Project(name: String, warning: String, scapegoatWarning: String, scapegoatError: String, scapegoatInfo: String, sCoverage: String,
+  cpd: String, loc: String, date: String, diff: String, color: String, scapegoatHtmlReport: String, scalastyleXmlReport: String)
+
+case class ProjectInformation(completeNameOfProject: String, date: String, data: Future[String])
+
+class CommonUtil {
+
+  val constant = Constant
+
+  /**
+   * Calculates total number of warnings in the XML file
+   *
+   * @param file path in string
+   * @return number of warnings
+   */
+  def findScalaStyleWarnings(file: String): (String, String, String) = {
+
+    if (file contains (constant.DELIMITER)) {
+      val project = file.split(constant.DELIMITER)(0)
+      val module = file.split(constant.DELIMITER)(1) + constant.DELIMITER + file.split(constant.DELIMITER)(2) + constant.DELIMITER
+      S3Util.findWarning(project, module)
+    } else {
+      S3Util.findWarning(file, "")
+    }
+
+  }
+
+  /**
+   * Extract project names from project paths
+   *
+   * @param projectList
+   * @return name of the projects
+   */
+  def findProjectName(projectList: List[String]): List[String] = {
+
+    val tempNameList: ListBuffer[String] = ListBuffer()
+    for (project <- projectList) {
+      tempNameList += project.split('/').last
+    }
+    tempNameList.toList
+  }
+
+  /**
+   * Calculates total number of scapegoat warnings in the XML file
+   *
+   * @param scapegoatXml
+   * @return Warning section of scapegoat
+   */
+  def findScapegoatWarnings(scapegoatXml: Elem): String = (scapegoatXml \\ constant.SCAPEGOAT \ constant.WARNS).toString
+
+  /**
+   * Calculates total number of scapegoat errors in the XML file
+   *
+   * @param scapegoatXml
+   * @return Error section of scapegoat
+   */
+
+  def findScapegoatError(scapegoatXml: Elem): String = (scapegoatXml \\ constant.SCAPEGOAT \ constant.ERRORS).toString
+
+  /**
+   * Calculates total number of scapegoat infos in the XML file
+   *
+   * @param scapegoatXml
+   * @return Info section of scapegoat
+   */
+
+  def findScapegoatInfos(scapegoatXml: Elem): String = (scapegoatXml \\ constant.SCAPEGOAT \ constant.INFOS).toString
+
+  def fetchDetails(path: String, version: String, projectList: ListBuffer[Project], build: String, color: String): ListBuffer[Project] = {
+    try {
+      val name = path
+      val completePath = path
+      val (warning, date, diff) = findScalaStyleWarnings(completePath)
+      val bgColor = color
+      val projectPath = completePath.split(constant.DELIMITER)(0)
+      val module = completePath.split(constant.DELIMITER)(1) + constant.DELIMITER + completePath.split(constant.DELIMITER)(2) + constant.DELIMITER
+      val (scapegoatWarnings, scapegoatErrors, scapegoatInfos) = if (completePath contains (constant.DELIMITER)) {
+        S3Util.findScapegoat(projectPath, module, version)
+      } else {
+        S3Util.findScapegoat(completePath, "", version)
+      }
+      val scoverageResult = S3Util.findScoverageReport(version, completePath)
+      val scapegoatHtmlReport = S3Util.findScapegoatHTMLReport(version, completePath)
+      val cpdResult = S3Util.findCopyPasteDetectorReport(version, completePath)
+      val scalastyleXmlReport = S3Util.findScalastyleXmlReport(projectPath, module)
+      val loc = S3Util.findLineOfCodes(version, completePath)
+      val project = new Project(name, warning, scapegoatWarnings, scapegoatErrors, scapegoatInfos, scoverageResult,
+        cpdResult, loc, date, diff, bgColor, scapegoatHtmlReport, scalastyleXmlReport)
+      projectList += project
+    } catch {
+      case ex: Exception => Logger.info("<< Exception in fetchDetails >>" + ex.printStackTrace())
+    }
+    projectList
+  }
+
+  def loginDetails(implicit app: play.api.Application): List[String] = {
+    val filePath = app.getFile("/logs/login.txt")
+    var listProjects = List[String]()
+    val fileContent = Source.fromFile(filePath).getLines().toList
+    for (length <- 0 until fileContent.length) {
+      val fileContentList = (fileContent(length).split(" ").toList)
+      listProjects ++= List(fileContentList(7))
+    }
+    listProjects
+  }
+
+  /**
+   * Password Encryption
+   *
+   * @param input
+   * @return
+   */
+  def md5(input: Option[String]): Option[String] = {
+    if (input.isEmpty) {
+      None
+    } else {
+      val digest: MessageDigest = MessageDigest.getInstance("MD5")
+      val byte = 16
+      digest.update((input).fold("")(input => input).getBytes, 0, (input).fold("")(input => input).length)
+      val md5 = Some(new BigInteger(1, digest.digest).toString(byte))
+
+      md5
+    }
+  }
+
+  def generateInviteLink(host: String, linkDetails: Link): (String, String, String) = {
+    val linkId = UUID.randomUUID().toString
+    linkDetails.username match {
+      case Some(username) => (LOGIN_LINK.format(host, linkId), username, linkId)
+      case None => (REGISTRATION_LINK.format(host, linkId), linkDetails.email, linkId)
+    }
+  }
+
+  /**
+   * Send Email Notification
+   *
+   * @param recipient
+   * @param subject
+   * @param message
+   * @return
+   */
+  def sendEmail(recipient: String, subject: String, message: String): Option[ClientResponse] = {
+    try {
+      val client: Client = Client.create
+      client.addFilter(new HTTPBasicAuthFilter("api", mailgunApiKey))
+      val webResource: WebResource = client.resource(mailgunApiUrl)
+      val formData: MultivaluedMapImpl = new MultivaluedMapImpl
+      formData.add("from", FROM_EMAIL_ID)
+      formData.add("to", recipient)
+      formData.add("subject", subject)
+      formData.add("html", message)
+      Some(webResource.`type`(MediaType.APPLICATION_FORM_URLENCODED).post(classOf[ClientResponse], formData))
+    } catch {
+      case ex: Exception => Logger.info("Exception in sending Email " + ex.printStackTrace()); None
+    }
+  }
+
+}
+
+object CommonUtil extends CommonUtil]]></codefragment>
+  </duplication>
+  <duplication lines="144" tokens="979">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/RegistrationController.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/RegistrationController.scala"/>
+    <codefragment><![CDATA[package controllers
+
+import com.google.inject.Inject
+import dbservice.{ CollaboratorDbService, LinksDbService, ProjectDbService, RegistrationDbService }
+import model.Collaborator.LinkDetail
+import model.Register.RegisterUser
+import org.joda.time.DateTime
+import play.api.Logger
+import play.api.Play.current
+import play.api.data.Form
+import play.api.data.Forms._
+import play.api.i18n.Messages.Implicits._
+import play.api.mvc.{ Cookie, Action, AnyContent, Controller }
+import util.CommonUtil
+import util.Constant._
+
+class RegistrationController @Inject() (registrationDbService: RegistrationDbService, collaboratorService: CollaboratorDbService,
+    linksDbService: LinksDbService, commonUtil: CommonUtil, projectDbService: ProjectDbService) extends Controller {
+
+  val registrationForm = Form(
+    mapping(
+      "username" -> nonEmptyText,
+      "email" -> email,
+      "password" -> nonEmptyText,
+      "confirmPassword" -> nonEmptyText,
+      "linkId" -> optional(text)
+    )(RegisterUser.apply)(RegisterUser.unapply)
+  )
+
+  def registerForm: Action[AnyContent] = Action { implicit request =>
+    request.getQueryString("id") match {
+      case Some(linkId) =>
+        val links = linksDbService.getLink(linkId): List[LinkDetail]
+        if (!links.exists(link => !(link.is_expired == "true"))) Ok(views.html.error())
+        else fillRegisterFormWithEmail(links, linkId)
+      case None => request.session.get("username").fold(Ok(views.html.registerForm(registrationForm)).withNewSession)(user => loadDashboardPage(user))
+    }
+  }
+
+  private def fillRegisterFormWithEmail(links: List[LinkDetail], linkId: String)(implicit request: play.api.mvc.RequestHeader) = {
+    links.headOption match {
+      case Some(linkDetails) => Ok(views.html.registerForm(registrationForm.fill(RegisterUser(EMPTY, linkDetails.username, EMPTY, EMPTY, Some(linkId))))).withNewSession
+      case None => Ok(views.html.registerForm(registrationForm.fill(RegisterUser(EMPTY, EMPTY, EMPTY, EMPTY, Some(linkId))))).withNewSession
+    }
+  }
+
+  def register: Action[AnyContent] = Action { implicit request =>
+    registrationForm.bindFromRequest.fold(
+      formWithErrors => {
+        BadRequest(views.html.registerForm(formWithErrors))
+      },
+      userData => {
+        val encryptPassword = commonUtil.md5(Some(userData.password)).fold(EMPTY)(userPassword => userPassword)
+        registrationDbService.registerUser(userData.username, encryptPassword, userData.email)
+        commonUtil.sendEmail(userData.email, "Welcome to Code Squad !!", views.html.mailTemplates.userRegistrationMail(userData.username).toString())
+        Logger.info("<<< User successfully registered >>> " + userData.username)
+
+        userData.linkId match {
+          case Some(id) =>
+            val links = linksDbService.getLink(id): List[LinkDetail]
+            if (!links.exists(link => !(link.is_expired == "true"))) Ok(views.html.error())
+            else authenticateUserForActivationLink(links, userData, id)
+          case None => showWelcomePage(userData.username)
+        }
+      }
+    )
+  }
+
+  private def authenticateUserForActivationLink(links: List[LinkDetail], userData: RegisterUser, id: String)(implicit request: play.api.mvc.RequestHeader) = {
+    links.headOption match {
+      case Some(linkDetails) =>
+        if (userData.email.equalsIgnoreCase(linkDetails.username)) {
+          linksDbService.destroyLink(id)
+          collaboratorService.createNewCollaborator(
+            userData.username,
+            linkDetails.project_name
+          ).fold(loadDashboardPage(userData.username)) {
+            errorMessage =>
+              Ok(views.html.registerForm(registrationForm.fill(RegisterUser(userData.username, userData.email, EMPTY, EMPTY, Some(id)))))
+                .flashing("error" -> errorMessage)
+          }
+        } else {
+          Ok(views.html.registerForm(registrationForm.fill(RegisterUser(userData.username, userData.email, EMPTY, EMPTY, Some(id)))))
+            .flashing("error" -> ErrorMessages.invalidInvitee)
+        }
+      case None => showWelcomePage(userData.username)
+    }
+  }
+
+  private def showWelcomePage(username: String)(implicit request: play.api.mvc.RequestHeader) = {
+    Redirect("/welcome-user").withSession("username" -> username).withHeaders(
+      CACHE_CONTROL -> "no-cache",
+      PRAGMA -> "no-cache",
+      CACHE_CONTROL -> "no-store"
+    ).withDateHeaders(EXPIRES -> DateTime.now())
+  }
+
+  def isUsernameExist(username: String): Action[AnyContent] = Action { implicit request =>
+    if (checkUsername(username)) Ok("false") else Ok("true")
+  }
+
+  private def checkUsername(username: String): Boolean = {
+    if (registrationDbService.getUserName(username).nonEmpty) true else false
+  }
+
+  private def loadDashboardPage(user: String, errorMessage: Option[String] = None)(implicit request: play.api.mvc.RequestHeader) = {
+    val projectName = projectDbService.getProjectDetailsForNewUser(user).map { project =>
+      val (projectName, isAdmin) = project
+      projectName
+    }.distinct
+    val projectNameFromDashboard = projectDbService.getProjectNamesFromDashboardDetails.distinct
+    val projectExists = projectName.intersect(projectNameFromDashboard)
+    Logger.info(projectName.toString() + "\n" + projectNameFromDashboard.toString() + "\n" + projectExists.toString())
+
+    errorMessage match {
+      case Some(error) =>
+        if (projectDbService.getProjectDetailsForNewUser(user).isEmpty) sessionWithError("/welcome-user", user, error, "addProjectError")
+        else if (projectExists.isEmpty) sessionWithError("/help", user, error, "error")
+        else sessionWithError("/dashboard", user, error, "error")
+
+      case None =>
+        if (projectDbService.getProjectDetailsForNewUser(user).isEmpty) sessionWithoutError("/welcome-user", user)
+        else if (projectExists.isEmpty) sessionWithoutError("/help", user)
+        else sessionWithoutError("/dashboard", user)
+    }
+  }
+
+  private def sessionWithError(url: String, user: String, error: String, errorKey: String)(implicit request: play.api.mvc.RequestHeader) = {
+    Redirect(url).withSession("username" -> user).withHeaders(
+      CACHE_CONTROL -> "no-cache",
+      PRAGMA -> "no-cache",
+      CACHE_CONTROL -> "no-store"
+    ).withDateHeaders(EXPIRES -> DateTime.now()).flashing(errorKey -> error)
+  }
+
+  private def sessionWithoutError(url: String, user: String)(implicit request: play.api.mvc.RequestHeader) = {
+    Redirect(url).withSession("username" -> user).withHeaders(
+      CACHE_CONTROL -> "no-cache",
+      PRAGMA -> "no-cache",
+      CACHE_CONTROL -> "no-store"
+    ).withDateHeaders(EXPIRES -> DateTime.now())
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="187" tokens="901">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/ProjectDbService.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/ProjectDbService.scala"/>
+    <codefragment><![CDATA[package dbservice
+
+import anorm._
+import com.google.inject.Inject
+import model.DashboardReports._
+import parser.ReportsParser._
+import play.api._
+import play.api.db.Database
+import util.SqlQuery._
+/**
+ * Created by knoldus on 19/7/16.
+ */
+
+class ProjectDbService @Inject() (db: Database) {
+  //scalastyle:off
+  def insert(projectName: String, moduleName: String, scalaStyle: String,
+    scapeGoat_warning: String, scapeGoat_info: String,
+    scapeGoat_error: String, sCoverage: String,
+    cpd: String, loc: String, modified_date: String): Unit = {
+    val id: Option[Long] =
+      db.withConnection { implicit connection =>
+        SQL(INSERT_DASHBOARD_DETAILS)
+          .on(
+            "project_name" -> projectName,
+            "module_name" -> moduleName,
+            "scala_style" -> scalaStyle,
+            "scapegoat_warning" -> scapeGoat_warning,
+            "scapegoat_info" -> scapeGoat_info,
+            "scapegoat_error" -> scapeGoat_error,
+            "scoverage" -> sCoverage,
+            "cpd" -> cpd,
+            "loc" -> loc,
+            "modified_date" -> modified_date
+          ).executeInsert()
+      }
+    Logger.info(s"Data inserted for $projectName $moduleName")
+  }
+
+  //scalastyle:on
+  def insertData(projectName: String, moduleName: String, reportsJson: String, date: String): Unit = {
+    db.withConnection { implicit connection =>
+      SQL(INSERT_REPORTS_JSON)
+        .on(
+          "project_name" -> projectName,
+          "module_name" -> moduleName,
+          "data" -> reportsJson,
+          "modified_date" -> date
+        ).executeInsert()
+    }
+  }
+  //scalastyle:on
+
+  def insertReports(projectName: String, moduleName: String, scalaStyleXml: String, scapegoatHtml: String): Unit = {
+    db.withConnection { implicit connection =>
+      SQL(INSERT_XML_HTML_REPORTS)
+        .on(
+          "project_name" -> projectName,
+          "module_name" -> moduleName,
+          "scalastyle_xml" -> scalaStyleXml,
+          "scapegoat_html" -> scapegoatHtml
+        ).executeInsert()
+    }
+
+  }
+
+  def getAllDetails(project: String, moduleName: String, duration: String): List[ProjectDetails] = {
+    db.withConnection { implicit connection =>
+      val projectdetails = SQL(GET_GRAPH_DETAILS)
+        .on(
+          "project_name" -> project,
+          "module_name" -> moduleName,
+          "duration" -> duration
+        ).as(projectDetailsParser.*)
+      projectdetails
+    }
+  }
+
+  def getDashboardDetailsFromDb(username: String): List[DashboardDetails] = {
+    db.withConnection { implicit connection =>
+      val allDetails = SQL(GET_DASHBOARD_DETAILS_FOR_PROJECT)
+        .on("projectName" -> username)
+        .as(dashboardDetailsParser.*)
+      allDetails
+    }
+  }
+
+  //Our
+  def getDashboardDetailsFromDatabase(username: String): List[NewDashboardDetails] = {
+    db.withConnection { implicit connection =>
+      val allDetails = SQL(GET_PROJECT_INFORMATION)
+        .on("projectName" -> username)
+        .as(newDashboardParser.*)
+      allDetails
+    }
+  }
+
+  def getDashboardDetailsforAllProjs: List[DashboardDetails] = {
+    db.withConnection { implicit connection =>
+      val projectDetail = SQL(GET_ALLPROJECT_DETAILS)
+        .as(dashboardDetailsParser.*)
+      projectDetail
+    }
+  }
+  //Our
+  def getDashboardDetailsForAllProjs: List[NewDashboardDetails] = {
+    db.withConnection { implicit connection =>
+      val projectDetail = SQL(GET_ALL_PROJ_DETAILS)
+        .as(newDashboardParser.*)
+      projectDetail
+    }
+  }
+
+  def getScapeGoatReport(projectName: String, moduleName: String): String = {
+    db.withConnection { implicit connection =>
+      val scapeGoatReport = SQL(GET_SCAPEGOAT_REPORT)
+        .on("project_name" -> projectName, "module_name" -> moduleName)
+        .as(SqlParser.str("scapegoat_html").single)
+      scapeGoatReport
+    }
+  }
+
+  def getScalaStyleReport(projectName: String, moduleName: String): String = {
+    db.withConnection { implicit connection =>
+      val scalaStyleReport = SQL(GET_SCALASTYLE_REPORT)
+        .on("project_name" -> projectName, "module_name" -> moduleName)
+        .as(SqlParser.str("scalastyle_xml").single)
+      scalaStyleReport
+    }
+  }
+
+  def getProjectDetailsForNewUser(username: String): List[(String, String)] = {
+    db.withConnection { implicit connection =>
+      val newUserProjectDetails = SQL(GET_USER_PROJECT_FORUSER)
+        .on("username" -> username)
+        .as(projectAdminParser.*)
+      Logger.info("Users found." + newUserProjectDetails)
+      newUserProjectDetails
+    }
+  }
+
+  def getAllProjectNames(): List[String] = {
+    db.withConnection { implicit connection =>
+      val projectNames = SQL(GET_PROJECT_NAMES).as(SqlParser.str("p_name").*)
+      projectNames
+    }
+  }
+
+  def getAllProjsForUser(username: String): List[String] = {
+    db.withConnection { implicit connection =>
+      SQL(GET_PROJECTS_FOR_USER).on("username" -> username).as(SqlParser.str("project").*)
+    }
+  }
+
+  def getProjectNamesFromDashboardDetails: List[String] = {
+    db.withConnection { implicit connection =>
+      val projectNames = SQL(GET_PROJECT_NAME_FROM_DASHBOARD).as(SqlParser.str("project_name").*)
+      projectNames
+    }
+  }
+
+  def getModuleFromProjectName(projectName: String): List[String] = {
+    db.withConnection { implicit connection =>
+      val moduleNames = SQL(GET_MODULE_NAME_BY_PROJECT)
+        .on("project_name" -> projectName)
+        .as(SqlParser.str("module_name").*)
+      moduleNames
+    }
+  }
+
+  def getUserProject: List[(String, String)] = {
+    db.withConnection { implicit connection =>
+      val userProjectDetails = SQL(GET_USER_PROJECT).as(userProjectParser.*)
+      userProjectDetails
+    }
+  }
+
+  def getModifiedDate(projectName: String): List[String] = {
+    db.withConnection { implicit connection =>
+      val modifiedDate = SQL(GET_MODIFIED_DATE)
+        .on("project_name" -> projectName)
+        .as(SqlParser.str("modified_date").*)
+      Logger.info(modifiedDate.toString() + "+++++++++++++++++++++++++++++++=======================")
+      modifiedDate
+    }
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="158" tokens="872">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/ProjectSettingsController.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/ProjectSettingsController.scala"/>
+    <codefragment><![CDATA[package controllers
+
+import com.amazonaws.services.identitymanagement.model.CreateAccessKeyResult
+import com.google.inject.Inject
+import dbservice.{ AccountSettingsDbService, ProjectSettingsDbService }
+import model.AccountSettings.CredKeys
+import model.DashboardReports.ProjectDetails
+import org.joda.time.DateTime
+import play.api.Logger
+import play.api.Play.current
+import play.api.data.Form
+import play.api.data.Forms._
+import play.api.i18n.Messages.Implicits._
+import play.api.libs.json.{ Json, Writes }
+import play.api.mvc.{ Action, AnyContent, Controller }
+import util.IAMUtil
+
+/**
+ * Created by deepak on 13/9/16.
+ */
+class ProjectSettingsController @Inject() (
+    accountSettingsDbService: AccountSettingsDbService,
+    projectSettingsDbService: ProjectSettingsDbService, iamUtil: IAMUtil
+) extends Controller with Authenticator {
+
+  val addProjectForm = Form(
+    single(
+      "projectName" -> nonEmptyText
+    )
+  )
+
+  def welcomeUser: Action[AnyContent] = Action { implicit request =>
+    val username = request.session.get("username")
+    username match {
+      case Some(user) => {
+        val userEmail = accountSettingsDbService.showEmail(username.headOption.fold("")(username => username))
+        Ok(views.html.welcomeUser(addProjectForm, user, userEmail)).withSession("username" -> user).withHeaders(
+          CACHE_CONTROL -> "no-cache",
+          PRAGMA -> "no-cache",
+          CACHE_CONTROL -> "no-store"
+        ).withDateHeaders(EXPIRES -> DateTime.now())
+      }
+      case None => Redirect("/login").flashing("error" -> "No proper user signed in.")
+    }
+  }
+
+  def createNewProject: Action[AnyContent] = Action { implicit request =>
+    val username = request.session.get("username").fold("")(username => username)
+    val userEmail = accountSettingsDbService.showEmail(username)
+    addProjectForm.bindFromRequest.fold(
+      formWithErrors => {
+        BadRequest(views.html.welcomeUser(formWithErrors, username, userEmail))
+      },
+      projectName => {
+        Logger.info("<< project name >>" + projectName + "<< username >>" + username)
+        if (projectSettingsDbService.getNumberOfProjectsAddedByUser(username) < 2) {
+          try {
+            iamUtil.createAddUserToGroupAWS(projectName)
+            iamUtil.createObject(projectName)
+            iamUtil.createAccessKeyForUser(projectName) match {
+              case Some(accessKeyResult) => {
+                val (userAccessKey, userSecretKey) = iamUtil.getKeysFromResult(accessKeyResult).fold(("", ""))(keys => keys)
+                projectSettingsDbService.putUserProjectDetails(projectName, userAccessKey, userSecretKey)
+                projectSettingsDbService.putUserProject(username, projectName, "Y")
+                Redirect("/help")
+              }
+              case None =>
+                Redirect("/welcome-user").flashing("addProjectError" -> "Please choose another project name. Project name already exists.")
+            }
+          } catch {
+            case ex: Exception => Ok("Error Raised in S3" + ex.printStackTrace())
+          }
+        } else {
+          Redirect("/welcome-user").flashing("upgradeProjectError" -> "Please Upgrade to add another account")
+        }
+      }
+    )
+  }
+
+  def isProjectNameExist(projectName: String): Action[AnyContent] = Action { implicit request =>
+    val project = projectSettingsDbService.getProjectName(projectName)
+    val isExist = if (project.length != 0) true else false
+
+    if (isExist) {
+      Ok("false")
+    } else {
+      Ok("true")
+    }
+  }
+
+  def deleteProject(projectName: String, accessKey: String): Action[AnyContent] = withAjaxRequest { implicit request =>
+    //get access key from database
+    val accessKey = projectSettingsDbService.getAccessKeyByProject(projectName).headOption.fold("Not Found")(accessKey => accessKey.accessKey)
+    if ((accessKey.equals(accessKey))) {
+      if (deleteProjFromDB(projectName)) {
+        deleteProjectFromS3(projectName, accessKey)
+        Ok("true")
+      } else BadRequest("Could not delete")
+    } else BadRequest("Access key does not match")
+  }
+
+  private def deleteProjectFromS3(projectName: String, accessKey: String): Boolean = {
+    try {
+      //delete access key for project
+      iamUtil.deleteAccessKeys(projectName, accessKey: String)
+      //delete user from group
+      iamUtil.removeUserFromGroup(projectName)
+      //delete user
+      iamUtil.deleteIAMUser(projectName)
+      //delete object for project
+      iamUtil.deleteObject(projectName)
+      true
+    } catch {
+      case ex: Exception =>
+        Logger.info("Error while deleting Project from S3" + ex.printStackTrace())
+        false
+    }
+  }
+
+  private def deleteProjFromDB(projectName: String): Boolean = {
+    try {
+      projectSettingsDbService.deleteProject(projectName)
+      true
+    } catch {
+      case ex: Exception =>
+        Logger.info("Error while deleting Project from database" + ex.printStackTrace())
+        false
+    }
+  }
+
+  def projectSettings: Action[AnyContent] = withAjaxRequest { implicit request =>
+    val username = request.session.get("username")
+    username match {
+      case Some(user) => {
+        Ok(views.html.projectSettings()).withSession("username" -> user).withHeaders(
+          CACHE_CONTROL -> "no-cache",
+          PRAGMA -> "no-cache",
+          CACHE_CONTROL -> "no-store"
+        ).withDateHeaders(EXPIRES -> DateTime.now())
+      }
+      case None => Redirect("/login").flashing("error" -> "No proper user signed in.")
+    }
+  }
+
+  def getAccessKeyByProject(projectName: String): Action[AnyContent] = withAjaxRequest { implicit request =>
+
+    val credKeys = projectSettingsDbService.getAccessKeyByProject(projectName)
+
+    implicit val credKeysWrites = new Writes[CredKeys] {
+      def writes(cd: CredKeys) = Json.obj(
+        "access_key" -> cd.accessKey,
+        "secret_key" -> cd.secretKey
+      )
+    }
+    Ok(Json.obj("credKey" -> Json.toJson(credKeys)))
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="119" tokens="872">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/util/Constant.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/util/Constant.scala"/>
+    <codefragment><![CDATA[package util
+
+import com.amazonaws.auth.BasicAWSCredentials
+import com.amazonaws.services.identitymanagement.AmazonIdentityManagementClient
+import com.amazonaws.services.identitymanagement.model.AttachGroupPolicyRequest
+import com.amazonaws.services.s3.AmazonS3Client
+import com.typesafe.config.ConfigFactory
+
+//scalastyle:off
+/**
+ * All the constants that are being used in the calculation or the generation of the report
+ */
+object Constant {
+
+  val SCALASTYLEXML = "target/scalastyle-result.xml"
+  val SEVERITY = "@severity"
+  val ERROR = "error"
+  val WARNING = "warning"
+  val WARNINGTEXT = "warning.text"
+  val NA = "N/A"
+
+  val SCAPEGOAT = "scapegoat"
+  val SCAPEGOATPATH = "target/scapegoat-report/scapegoat.xml"
+  val SCAPEGOATHTMLPATH = "target/scapegoat-report/scapegoat.html"
+  val ERRORS = "@errors"
+  val INFOS = "@infos"
+  val WARNS = "@warns"
+
+  val SCOVERAGE = "scoverage"
+  val STATEMENTRATE = "@statement-rate"
+  val STATEMENTCOUNT = "@statement-count"
+  val XMLPATH = "target/scoverage-report/scoverage.xml"
+  val TARGET = "target/"
+
+  val ZERO = "0"
+  val CPDPATH = "cpd.xml"
+  val DUPLICATION = "duplication"
+
+  val DELIMITER = "/"
+
+  val STATS = "stats.log"
+
+  val REGEXP = "[0-9]+[0-9]+"
+
+  val LIMIT = 6
+  val WHITE = "white"
+  val COLOR = "#e9e9e9"
+
+  val USERNAME = "knoldus"
+  val DAYHOURS = 86400000
+  val conf = ConfigFactory.load()
+  val accessKey = conf.getString("access-key")
+  val secretKey = conf.getString("secret-key")
+  val mailgunApiKey = conf.getString("mailgun-api-key")
+  val mailgunApiUrl = conf.getString("mailgun-api-url")
+  val mailerTime = conf.getString("mailer-time")
+  val credentials = new BasicAWSCredentials(accessKey, secretKey)
+  val s3client = new AmazonS3Client(credentials)
+
+  val cpdXSD = "/home/knoldus/Documents/CodeSquad/server/conf/xsdFiles/cpd.xsd"
+  val scalastylewarningXSD = "/home/knoldus/Documents/CodeSquad/server/conf/xsdFiles/scalastyleWarning.xsd"
+  val scapegoatXSD = "/home/knoldus/Documents/CodeSquad/server/conf/xsdFiles/scapegoat.xsd"
+  val scoverageXSD = "/home/knoldus/Documents/CodeSquad/server/conf/xsdFiles/scoverage.xsd"
+
+  object ErrorMessages {
+    val inviteCancelledError = "Invitation cannot be cancelled"
+    val linksLimitExceedError = s"Your limit of sending invitation links has completed. You may cancel some invitations, delete some collaborators. or send an email to CodeSquad to continue your services."
+    val projectNotFoundError = "Project details were not found for project '%s'"
+    val userNotFoundError = "%s is not a registered user. Please enter a registered user or email id to send an invitation"
+    val emailNotFoundError = "%s is not a registered user. Please enter a registered email id to receive the link"
+    val collaboratorFoundError = "User %s for project %s already exists"
+    val invalidEmailMessage = "Please enter a valid email"
+    val invalidUserLogIn = "%s please login to your account first, then open for the activation link again"
+    val invalidInvitee = "You are not the authorized user for this activation link"
+    val collaboratorDeletionError = "Error occurred in removing Collaborator. Please try again after some time."
+    val sessionExistError = "%s is not an authorized user for this activation link and needs to log out"
+    val sessionExpireError = "Session has expired"
+  }
+
+  object SuccessMessage {
+    val inviteCancelledMessage = "Invitation has been cancelled successfully"
+    val inviteSentMessage = "A mail is sent to %s to accept the invitation"
+    val passwordUpdateSentMessage = "A mail is sent to %s to reset the password"
+    val collaboratorDeletedMessage = "Collaborator %s has been removed successfully"
+    val collaboratorUserOwnMessage = "User cannot delete himself"
+    val changeEmailSuccess = "Email has been updated successfully"
+  }
+
+  object LinkType extends Enumeration {
+    val login = Value("login")
+    val registration = Value("registration")
+  }
+
+  val EMAIL_REGEX =
+    """^[-a-z0-9!#$%&'*+/=?^_`{|}~]+(\.[-a-z0-9!#$%&'*+/=?^_`{|}~]+)*@([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.)*(aero|arpa|asia|biz|cat""" +
+      """|com|coop|edu|gov|info|int|jobs|mil|mobi|museum|name|net|org|pro|tel|travel|[a-z][a-z])$"""
+  val iamuser = new AmazonIdentityManagementClient(credentials)
+  val attachGrpPolicyRequest = new AttachGroupPolicyRequest()
+
+  val BUCKET_NAME = "code-squad-reports"
+  val GROUP_NAME = "codesquad-projects"
+  val YES = "Y"
+  val NO = "N"
+  val EMPTY = ""
+  val LOGIN_LINK = "http://%s/login?id=%s"
+  val REGISTRATION_LINK = "http://%s/registerForm?id=%s"
+  val CHANGE_PASSWORD_LINK = "http://%s/password?id=%s"
+  val MAILGUN_API_KEY = "key-110e0098c48ac7b50ef5c1a8468ccb0b"
+  val MAILGUN_API_URL = "https://api.mailgun.net/v3/getcodesquad.com/messages"
+  val FROM_EMAIL_ID = "codesquad@getcodesquad.com"
+  val SUBJECT = "Welcome to Codesquad"
+  val INVITATION_MAIL_SUBJECT = "Code Squad Project Invitation"
+  val PASSWORD_LINK_MAIL_SUBJECT = "Code Squad Change password Link"
+  val DEFAULT_ADMIN = "Code Squad"
+  val EXPIRE_LINK_STATUS = "false"
+  val TRIAL_PLAN_LINKS_LIMIT = 4
+}
+
+//scalastyle:on]]></codefragment>
+  </duplication>
+  <duplication lines="137" tokens="843">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/CollaboratorController.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/CollaboratorController.scala"/>
+    <codefragment><![CDATA[package controllers
+
+import javax.inject.Inject
+import dbservice.{ CollaboratorDbService, LinksDbService }
+import model.Collaborator.{ Collaborator, PendingInvite, Link, LinkDetail }
+import play.api.Logger
+import play.api.libs.json.{ Writes, Json }
+import play.api.mvc.{ Action, AnyContent, Controller }
+import util.CommonUtil
+import util.Constant._
+import play.api.libs.functional.syntax._
+import play.api.libs.json._
+
+class CollaboratorController @Inject() (collaboratorService: CollaboratorDbService, utilities: CommonUtil,
+    linksDbService: LinksDbService) extends Controller with Authenticator {
+
+  /**
+   * Validates the limit of trial plan and generates and sends an invitation link
+   * @param projectName
+   * @param collaboratorName
+   * @return
+   */
+  def generateActivationLink(projectName: String, collaboratorName: String): Action[AnyContent] = withAjaxRequest { implicit request =>
+    request.session.get("username") match {
+      case Some(adminName) =>
+        validateTrialPlan(adminName, projectName) match {
+          case Some(errorMessage) => Ok(Json.obj("message" -> errorMessage, "status" -> "error"))
+          case None =>
+            collaboratorService.validateCollaborator(projectName, collaboratorName) match {
+              case Right(linkDetails) =>
+                val (invitationLink, user, linkId) = utilities.generateInviteLink(request.host, linkDetails)
+                val template = generateTemplate(linkDetails, adminName, projectName, invitationLink, user)
+                linksDbService.insertLink(LinkDetail(linkId, user, adminName, linkDetails.project, EXPIRE_LINK_STATUS))
+                sendInvitationMail(linkDetails, template)
+                Ok(Json.obj("message" -> SuccessMessage.inviteSentMessage.format(user), "status" -> "success"))
+              case Left(errorMessage) => Ok(Json.obj("message" -> errorMessage, "status" -> "error"))
+            }
+        }
+      case None => Redirect("/login").flashing("error" -> "No proper user signed in.")
+    }
+  }
+
+  private def sendInvitationMail(linkDetails: Link, template: String) = {
+    try {
+      utilities.sendEmail(linkDetails.email, INVITATION_MAIL_SUBJECT, template)
+      Logger.info(s"--- Mail has been sent to ${linkDetails.email} successfully ---")
+    } catch {
+      case ex: Exception => Logger.info(s"--- Error in sending mail ${linkDetails.email} ---" + ex.printStackTrace())
+    }
+  }
+
+  private def generateTemplate(linkDetails: Link, adminName: String, projectName: String, invitationLink: String, user: String) = {
+    if (linkDetails.linkType == LinkType.login) {
+      views.html.mailTemplates.invitationMail(adminName, Some(user), projectName, invitationLink).toString()
+    } else views.html.mailTemplates.invitationMail(adminName, None, projectName, invitationLink).toString()
+  }
+
+  private def validateTrialPlan(adminName: String, projectName: String): Option[String] = {
+    val collaboratorsCount = collaboratorService.getCollaboratorsByProject(projectName).length
+    val linksCount = linksDbService.countPendingInvites(adminName, projectName)
+    if (collaboratorsCount + linksCount <= TRIAL_PLAN_LINKS_LIMIT) None else Some(ErrorMessages.linksLimitExceedError)
+  }
+
+  /**
+   * Returns all collaborators
+   * @param projectName
+   * @return
+   */
+  def getAllCollaborators(projectName: String): Action[AnyContent] = withAjaxRequest { implicit request =>
+    val collaborators = collaboratorService.getAllCollaborators(projectName)
+    Ok(Json.obj("data" -> collaborators))
+  }
+
+  /**
+   * Returns all the pending invites for the admin related with a project
+   * @param projectName
+   * @return
+   */
+  def getPendingInvitesList(projectName: String): Action[AnyContent] = withAjaxRequest { implicit request =>
+    request.session.get("username") match {
+      case Some(adminName) =>
+        val invites = linksDbService.getPendingInvites(projectName, adminName)
+        Ok(Json.obj("data" -> invites))
+      case None => Redirect("/login").flashing("error" -> "No proper user signed in.")
+    }
+  }
+
+  /**
+   * Cancels an invitation
+   * @param inviteId
+   * @return
+   */
+  def cancelInvitation(inviteId: String): Action[AnyContent] = withAjaxRequest { implicit request =>
+    linksDbService.destroyLink(inviteId) > 0 match {
+      case true => Ok(Json.obj("message" -> SuccessMessage.inviteCancelledMessage, "status" -> "success"))
+      case false => Ok(Json.obj("message" -> ErrorMessages.inviteCancelledError, "status" -> "error"))
+    }
+  }
+
+  /**
+   * Deletes a collaborator
+   *
+   * @param projectName
+   * @param collaboratorName
+   * @return
+   */
+  def deleteCollaborator(projectName: String, collaboratorName: String): Action[AnyContent] = withAjaxRequest { implicit request =>
+    try {
+      collaboratorService.deleteCollaborator(projectName, collaboratorName)
+      Ok(Json.obj("message" -> SuccessMessage.collaboratorDeletedMessage.format(collaboratorName)))
+    } catch {
+      case ex: Exception => Ok(Json.obj("message" -> ErrorMessages.collaboratorDeletionError))
+    }
+
+  }
+
+  /**
+   * Returns all of the users
+   *
+   * @return
+   */
+  def getAllUsers: Action[AnyContent] = withAjaxRequest { implicit request =>
+    Ok(Json.obj("data" -> collaboratorService.getAllUsers))
+  }
+
+  implicit val pendingInviteWrites: Writes[PendingInvite] = (
+    (__ \ "invite_id").write[String] and
+    (__ \ "username").write[String]
+  )(unlift(PendingInvite.unapply))
+
+  implicit val collaboratorsWrites: Writes[Collaborator] = (
+    (__ \ "username").write[String] and
+    (__ \ "project").write[String] and
+    (__ \ "is_admin").write[String]
+  )(unlift(Collaborator.unapply))
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="132" tokens="725">
+    <file line="1" path="/home/knoldus/Documents/CodeSquad/server/app/util/IAMUtil.scala"/>
+    <file line="1" path="/home/knoldus/Documents/CodeSquad/server/app/util/IAMUtil.scala"/>
+    <codefragment><![CDATA[package util
+
+import java.io.File
+
+import com.amazonaws.services.identitymanagement.AmazonIdentityManagementClient
+import com.amazonaws.services.identitymanagement.model._
+import com.amazonaws.services.s3.model.{ ObjectMetadata, PutObjectRequest }
+import play.api.Logger
+import util.Constant._
+import java.io._
+import scala.collection.JavaConverters._
+
+/**
+ * Created by deepak on 15/9/16.
+ */
+class IAMUtil {
+
+  def createAddUserToGroupAWS(projectName: String): Unit = {
+    try {
+      val createUser = new CreateUserRequest(projectName)
+      val addUserToGroup = new AddUserToGroupRequest(GROUP_NAME, projectName)
+      val user = iamuser.createUser(createUser)
+      Logger.info("<<<<<< User in AWS created >>>>>" + user)
+      iamuser.addUserToGroup(addUserToGroup)
+    } catch {
+      case ex: Exception => Logger.info("Exception found CreateAddUserToGroupAWS:" + ex.printStackTrace())
+    }
+
+  }
+
+  def createAccessKeyForUser(projectName: String): Option[CreateAccessKeyResult] = {
+    try {
+      val accessKeyResult = iamuser.createAccessKey(new CreateAccessKeyRequest(projectName))
+      Logger.info("<<<< user added to group >>>>" + accessKeyResult)
+      Some(accessKeyResult)
+    } catch {
+      case ex: Exception =>
+        Logger.info("Exception found createAccessKeyForUser:" + ex.printStackTrace())
+        None
+    }
+
+  }
+
+  def getKeysFromResult(createAccessKeyResult: CreateAccessKeyResult): Option[(String, String)] = {
+    try {
+      val accessKey = createAccessKeyResult.getAccessKey
+      val userAccessKey = accessKey.getAccessKeyId
+      val userSecretKey = accessKey.getSecretAccessKey
+      Logger.info("user Access Keys >>>>>>>>" + userAccessKey + "user secret keys >>>>>> " + userSecretKey)
+      Some((userAccessKey, userSecretKey))
+    } catch {
+      case ex: Exception =>
+        Logger.info("Exception found getKeysFromResult:" + ex.printStackTrace())
+        None
+    }
+  }
+
+  def createObject(projectName: String): Unit = {
+    try {
+      val metadata = new ObjectMetadata()
+      metadata.setContentLength(0)
+      val byte = Array[Byte]()
+      val emptyContent = new ByteArrayInputStream(byte)
+      val putObject = new PutObjectRequest(BUCKET_NAME, projectName + "/", emptyContent, metadata)
+      Logger.info("<<<<<< object created >>>>>>" + putObject)
+      s3client.putObject(putObject)
+    } catch {
+      case ex: Exception => Logger.info("Exception found createObject:" + ex.printStackTrace())
+    }
+  }
+
+  def deleteObject(projectName: String): Boolean = {
+    if (s3client.doesObjectExist(BUCKET_NAME, projectName + "/")) {
+      s3client.deleteObject(BUCKET_NAME, projectName + "/")
+      Logger.info(s"Deleted $projectName object from S3")
+      true
+    } else {
+      Logger.info(s"Object $projectName does not exist in S3")
+      false
+    }
+  }
+
+  def deleteAccessKeys(projectName: String, accessKey: String): Boolean = {
+    val accessKeysResult: ListAccessKeysResult = iamuser.listAccessKeys(new ListAccessKeysRequest().withUserName(projectName))
+    val accessKeyMetadata = accessKeysResult.getAccessKeyMetadata.asScala.toList
+    if (!accessKeyMetadata.isEmpty) {
+      val matchingAccessKey = accessKeyMetadata.filter(_.getAccessKeyId.equals(accessKey))
+      if (!matchingAccessKey.isEmpty) {
+        iamuser.deleteAccessKey(new DeleteAccessKeyRequest(projectName, matchingAccessKey(0).getAccessKeyId))
+        Logger.info(s"Access Key for ${projectName} deleted")
+        true
+      } else {
+        Logger.info(s"Access Key for ${projectName} NOT FOUND")
+        false
+      }
+    } else {
+      Logger.info(s"No Access Key exists for ${projectName}")
+      false
+    }
+  }
+
+  def removeUserFromGroup(projectName: String): Boolean = {
+    val groupsList = iamuser.listGroupsForUser(new ListGroupsForUserRequest(projectName)).getGroups.asScala.toList
+    if (!groupsList.isEmpty) {
+      val matchingGroup = groupsList.filter(_.getGroupName.equals(GROUP_NAME))
+      if (!matchingGroup.isEmpty) {
+        iamuser.removeUserFromGroup(new RemoveUserFromGroupRequest(GROUP_NAME, projectName))
+        Logger.info("Removed from group")
+        true
+      } else {
+        Logger.info(s"$projectName is not in the $GROUP_NAME")
+        false
+      }
+    } else {
+      Logger.info(s"$projectName is not part of any group")
+      false
+    }
+  }
+
+  def deleteIAMUser(projectName: String): Unit = {
+    try {
+      iamuser.getUser(new GetUserRequest().withUserName(projectName))
+      iamuser.deleteUser(new DeleteUserRequest(projectName))
+      Logger.info(s"user $projectName deleted")
+    } catch {
+      case ex: NoSuchEntityException => Logger.info("The user does not exist")
+    }
+  }
+
+}
+
+object IAMUtil extends IAMUtil]]></codefragment>
+  </duplication>
+  <duplication lines="129" tokens="602">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/CollaboratorDbService.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/CollaboratorDbService.scala"/>
+    <codefragment><![CDATA[package dbservice
+
+import anorm._
+import com.google.inject.Inject
+import model.Collaborator.Link
+import model.Collaborator.Collaborator
+import parser.{ ParserHelper }
+import play.api.db.Database
+import util.Constant.{ LinkType, ErrorMessages, NO, EMAIL_REGEX }
+import util.SqlQuery._
+
+class CollaboratorDbService @Inject() (db: Database) {
+
+  def getAllUsers: List[String] = {
+    db.withConnection { implicit connection =>
+      SQL(GET_ALL_USERS).as(SqlParser.str("username").*)
+    }
+  }
+
+  def validateCollaborator(projectName: String, collaboratorUsernameOrEmail: String): Either[String, Link] = {
+    if (collaboratorUsernameOrEmail.contains('@')) {
+      isValidEmail(collaboratorUsernameOrEmail) match {
+        case Some(invalidEmailMessage) => Left(invalidEmailMessage)
+        case None => validateCollaboratorWithEmail(collaboratorUsernameOrEmail, projectName)
+      }
+    } else validateCollaboratorWithUsername(collaboratorUsernameOrEmail, projectName)
+  }
+
+  private def validateCollaboratorWithEmail(collaboratorUsernameOrEmail: String, projectName: String) = {
+    getUsernameByEmail(collaboratorUsernameOrEmail) match {
+      case Some(username) =>
+        if (checkIfCollaboratorExists(projectName, username) == 0) {
+          Right(Link(Some(username), collaboratorUsernameOrEmail, projectName, LinkType.login))
+        } else Left(ErrorMessages.collaboratorFoundError.format(collaboratorUsernameOrEmail, projectName))
+      case None => Right(Link(None, collaboratorUsernameOrEmail, projectName, LinkType.registration))
+    }
+  }
+
+  private def validateCollaboratorWithUsername(collaboratorUsernameOrEmail: String, projectName: String) = {
+    val isValidUser = db.withConnection { implicit connection =>
+      SQL(GET_USERNAME)
+        .on(
+          "username" -> collaboratorUsernameOrEmail
+        ).as(SqlParser.scalar[String].singleOpt)
+    }.fold(false)(result => true)
+
+    if (isValidUser) {
+      if (checkIfCollaboratorExists(projectName, collaboratorUsernameOrEmail) == 0) {
+        val userEmail = getEmailByUsername(collaboratorUsernameOrEmail)
+        Right(Link(Some(collaboratorUsernameOrEmail), userEmail, projectName, LinkType.login))
+      } else {
+        Left(ErrorMessages.collaboratorFoundError.format(collaboratorUsernameOrEmail, projectName))
+      }
+    } else Left(ErrorMessages.userNotFoundError.format(collaboratorUsernameOrEmail))
+  }
+
+  def createNewCollaborator(collaboratorName: String, projectName: String): Option[String] = {
+    if (checkIfCollaboratorExists(projectName, collaboratorName) == 0) {
+      db.withConnection { implicit connection =>
+        SQL(INSERT_USER_PROJECT)
+          .on(
+            "username" -> collaboratorName,
+            "project" -> projectName,
+            "is_admin" -> NO
+          )
+          .executeInsert()
+      }
+      None
+    } else {
+      Some(ErrorMessages.collaboratorFoundError.format(collaboratorName, projectName))
+    }
+  }
+
+  private def getEmailByUsername(username: String) = {
+    db.withConnection { implicit connection =>
+      SQL(GET_EMAIL_BY_USERNAME)
+        .on(
+          "username" -> username
+        ).as(SqlParser.scalar[String].single)
+    }
+  }
+
+  def deleteCollaborator(projectName: String, collaboratorName: String): Int = {
+    db.withConnection { implicit connection =>
+      SQL(DELETE_COLLABORATOR)
+        .on(
+          "username" -> collaboratorName,
+          "project" -> projectName
+        ).executeUpdate()
+    }
+  }
+
+  def getAllCollaborators(projectName: String): List[Collaborator] = {
+    getCollaboratorsByProject(projectName)
+  }
+
+  private def checkIfCollaboratorExists(projectName: String, collaboratorEmail: String) = {
+    db.withConnection { implicit connection =>
+      SQL(CHECK_IF_COLLABORATOR_EXISTS)
+        .on(
+          "username" -> collaboratorEmail,
+          "project" -> projectName
+        ).as(SqlParser.scalar[Long].single)
+    }
+  }
+
+  def getCollaboratorsByProject(projectName: String): List[Collaborator] = {
+    db.withConnection { implicit connection =>
+      SQL(GET_COLLABORATORS_BY_PROJECT)
+        .on(
+          "project" -> projectName
+        ).as(ParserHelper.collaboratorParser *)
+    }
+  }
+
+  def getUsernameByEmail(email_id: String): Option[String] = {
+    db.withConnection { implicit connection =>
+      SQL(GET_USER_BY_EMAIL)
+        .on(
+          "email_id" -> email_id
+        ).as(SqlParser.scalar[String].singleOpt)
+    }
+  }
+
+  private def isValidEmail(collaboratorName: String) = {
+    if (EMAIL_REGEX.r.findFirstIn(collaboratorName).isDefined) None else Some(ErrorMessages.invalidEmailMessage)
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="93" tokens="459">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/AccountSettingsDbService.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/AccountSettingsDbService.scala"/>
+    <codefragment><![CDATA[package dbservice
+
+import anorm._
+import com.google.inject.Inject
+import model.Login.UserLogin
+import play.api.Logger
+import play.api.db.Database
+import util.CommonUtil
+import util.SqlQuery._
+import parser.ReportsParser._
+import util.Constant.EMPTY
+
+class AccountSettingsDbService @Inject() (db: Database) {
+
+  val commonUtil: CommonUtil = CommonUtil
+
+  def changeEmail(username: String, email: String): Int = {
+
+    db.withConnection { implicit connection =>
+      Logger.info("username-------" + username + "------email-------" + email)
+      val updatedEmail = SQL(CHANGE_EMAIL)
+        .on("email_id" -> email, "username" -> username)
+        .executeUpdate()
+      Logger.info("Email was updated........" + updatedEmail)
+      updatedEmail
+    }
+  }
+
+  def showEmail(username: String): String = {
+    db.withConnection { implicit connection =>
+      val userEmail = SQL(GET_EMAIL_ID)
+        .on("username" -> username)
+        .as(SqlParser.str("email_id").single)
+      Logger.info("Email fetched........" + userEmail)
+      userEmail
+    }
+  }
+
+  def getPassword(username: String, password: String): List[UserLogin] = {
+    db.withConnection { implicit connection =>
+      val passwords = SQL(GET_PASSWORD)
+        .on("username" -> username, "password" -> password)
+        .as(userLoginParser.*)
+      passwords
+    }
+  }
+
+  def updateUserPassword(username: String, password: String): Int = {
+    val encryptedPassword = (commonUtil.md5(Some(password))).fold("")(userPassword => userPassword)
+    db.withConnection { implicit connection =>
+      val updatedPassword = SQL(CHANGE_PASSWORD)
+        .on("username" -> username, "password" -> encryptedPassword)
+        .executeUpdate()
+      updatedPassword
+    }
+  }
+
+  def updatePasswordByEmail(email_id: String, newPassword: String): Int = {
+    val encryptedPassword = commonUtil.md5(Some(newPassword)).fold(EMPTY)(userPassword => userPassword)
+    db.withConnection { implicit connection =>
+      val updatedPassword = SQL(CHANGE_PASSWORD_BY_EMAIL)
+        .on("email_id" -> email_id, "password" -> encryptedPassword)
+        .executeUpdate()
+      updatedPassword
+    }
+  }
+
+  def getEmail(newemail: String): List[String] = {
+    db.withConnection { implicit connection =>
+      val emails = SQL(GET_EMAIL_BYEMAIL)
+        .on("email_id" -> newemail)
+        .as(SqlParser.str("email_id").*)
+      emails
+    }
+  }
+
+  def isEmailExist(email_id: String): Option[String] = {
+    db.withConnection { implicit connection =>
+      SQL(GET_USER_BY_EMAIL)
+        .on("email_id" -> email_id)
+        .as(SqlParser.scalar[String].singleOpt)
+    }
+  }
+
+  def getUsername(email_id: String): String = {
+    db.withConnection { implicit connection =>
+      SQL(GET_USER_BY_EMAIL)
+        .on("email_id" -> email_id)
+        .as(SqlParser.scalar[String].single)
+    }
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="117" tokens="403">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/parser/ReportsParser.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/parser/ReportsParser.scala"/>
+    <codefragment><![CDATA[package parser
+
+import anorm.SqlParser._
+import anorm.~
+import model.AccountSettings.CredKeys
+import model.DashboardReports._
+import model.Login.UserLogin
+import org.joda.time.DateTime
+
+/**
+ * Created by knoldus on 19/8/16.
+ */
+object ReportsParser {
+  val projectDetailsParser = {
+    get[String]("scala_style") ~
+      get[String]("scapegoat_warning") ~
+      get[String]("scapegoat_error") ~
+      get[String]("scapegoat_info") ~
+      get[String]("cpd") ~
+      get[String]("scoverage") ~
+      get[DateTime]("time_stamp") map {
+        case scalaStyle ~
+          scapegoatWarning ~
+          scapegoatError ~
+          scapegoatInfo ~
+          cpd ~
+          scoverage ~
+          timeStamp => ProjectDetails(scalaStyle, scapegoatWarning, scapegoatError, scapegoatInfo, cpd, scoverage, timeStamp)
+
+      }
+  }
+
+  val dashboardDetailsParser = {
+    get[String]("project_name") ~
+      get[String]("module_name") ~
+      get[String]("scala_style") ~
+      get[String]("scapegoat_warning") ~
+      get[String]("scapegoat_info") ~
+      get[String]("scapegoat_error") ~
+      get[String]("scoverage") ~
+      get[String]("cpd") ~
+      get[String]("loc") ~
+      get[String]("modified_date") map {
+        case projectName ~
+          moduleName ~
+          scalaStyle ~
+          scapegoatWarning ~
+          scapegoatInfo ~
+          scapegoatError ~
+          scoverage ~
+          cpd ~
+          loc ~
+          modifiedDate => DashboardDetails(projectName, moduleName, scalaStyle, scapegoatWarning,
+          scapegoatInfo, scapegoatError, scoverage, cpd, loc, modifiedDate)
+      }
+
+  }
+
+  //our
+  val newDashboardParser = {
+    get[String]("project_name") ~
+      get[String]("module_name") ~
+      get[String]("data") ~
+      get[String]("modified_date") ~
+      get[DateTime]("time_stamp") map {
+        case projectName ~
+          moduleName ~
+          reportsJson ~
+          modifiedDate ~
+          timestamp => NewDashboardDetails(projectName, moduleName, reportsJson, modifiedDate, timestamp)
+      }
+
+  }
+
+  val dashboardReportsParser = {
+    get[String]("project_name") ~
+      get[String]("module_name") ~
+      get[String]("scalastyle_xml") ~
+      get[String]("scapegoat_html") map {
+        case projectName ~
+          moduleName ~
+          scalastyleXml ~
+          scapegoatHtml => ProjectReports(projectName, moduleName, scalastyleXml, scapegoatHtml)
+
+      }
+  }
+
+  val userLoginParser = {
+    get[String]("username") ~
+      get[String]("password") map {
+        case username ~ password => UserLogin(username, password)
+      }
+
+  }
+
+  val projectAdminParser = {
+    get[String]("project") ~
+      get[String]("is_admin") map {
+        case project ~ is_admin => (project, is_admin)
+      }
+
+  }
+  val userProjectParser = {
+    get[String]("username") ~
+      get[String]("project") map {
+        case username ~ project => (username, project)
+      }
+
+  }
+  val credKeysParser = {
+    get[String]("access_key") ~
+      get[String]("secret_key") map {
+        case accessKey ~ secretKey => CredKeys(accessKey, secretKey)
+      }
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="70" tokens="317">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/ProjectSettingsDbService.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/ProjectSettingsDbService.scala"/>
+    <codefragment><![CDATA[package dbservice
+
+import anorm._
+import com.google.inject.Inject
+import model.AccountSettings.CredKeys
+import play.api.db.Database
+import util.SqlQuery._
+import parser.ReportsParser.credKeysParser
+
+/**
+ * Created by deepak on 16/9/16.
+ */
+class ProjectSettingsDbService @Inject() (db: Database) {
+  def putUserProjectDetails(p_name: String, access_key: String, secret_key: String): Unit = {
+    db.withConnection { implicit connection =>
+      SQL(INSERT_USER_DETAILS)
+        .on(
+          "p_name" -> p_name,
+          "access_key" -> access_key,
+          "secret_key" -> secret_key
+        )
+        .executeInsert()
+
+    }
+
+  }
+
+  def getProjectName(projectName: String): List[String] = {
+    db.withConnection { implicit connection =>
+      val projectNames = SQL(GET_PROJECTNAME)
+        .on("p_name" -> projectName)
+        .as(SqlParser.str("p_name").*)
+      projectNames
+    }
+  }
+
+  def putUserProject(username: String, projectName: String, isAdmin: String): Unit = {
+    db.withConnection { implicit connection =>
+      SQL(INSERT_USER_PROJECT)
+        .on(
+          "username" -> username,
+          "project" -> projectName,
+          "is_admin" -> isAdmin
+        )
+        .executeInsert()
+    }
+  }
+
+  def deleteProject(projectName: String): Boolean = {
+    db.withTransaction { implicit connection =>
+      SQL(DELETE_FROM_DASHBOARD_DETAILS).on("project_name" -> projectName).executeUpdate()
+      SQL(DELETE_FROM_USER_PROJECT).on("project" -> projectName).executeUpdate()
+      SQL(DELETE_FROM_PROJ_DETAILS).on("p_name" -> projectName).executeUpdate()
+    }
+    true
+  }
+
+  def getAccessKeyByProject(projectName: String): List[CredKeys] = {
+    db.withConnection { implicit connection =>
+      SQL(GET_ACCESS_KEY).on("p_name" -> projectName).as(credKeysParser.*)
+    }
+  }
+
+  def getNumberOfProjectsAddedByUser(username: String): Int = {
+    db.withConnection { implicit connection =>
+      SQL(GET_NO_OF_PROJECTS_ADDED_BY_USER).on("username" -> username).as(SqlParser.int("count(*)").single)
+    }
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="43" tokens="235">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/ScapegoatParserActor.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/ScapegoatParserActor.scala"/>
+    <codefragment><![CDATA[package reportsParsers
+
+/**
+ * Created by knoldus on 30/10/17.
+ */
+
+import java.io.InputStream
+
+import scala.xml.Elem
+
+import akka.actor.Actor
+import model.ParsersResponse.ScapegoatReport
+import org.apache.commons.io.IOUtils
+import reportsParsers.ParserCalling.Parse
+import util.Constant
+
+class ScapegoatParserActor extends Actor {
+  val constant = Constant
+  val xmlValidator = new XMLValidator
+  override def receive = {
+    case Parse(scapegoatXml: Elem) =>
+      try {
+        val in: InputStream = IOUtils.toInputStream(scapegoatXml.toString(), "UTF-8")
+        if (xmlValidator.validate(in, constant.scapegoatXSD)) {
+          if ((scapegoatXml \\ constant.SCAPEGOAT).isEmpty) {
+            sender ! None
+          } else {
+            println("else condition scapegoat parser")
+            val sErrors = (scapegoatXml \\ constant.SCAPEGOAT \ constant.ERRORS).toString
+            val sInfos = (scapegoatXml \\ constant.SCAPEGOAT \ constant.INFOS).toString
+            val sWarnings = (scapegoatXml \\ constant.SCAPEGOAT \ constant.WARNS).toString
+            sender ! Some(ScapegoatReport(sErrors, sInfos, sWarnings))
+          }
+        } else {
+          println("\n\n==================invalid parser===========================\n\n")
+        }
+      } catch {
+        case ex: Exception => sender ! None
+      }
+
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="47" tokens="233">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/ScalaStyleWarningParserActor.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/ScalaStyleWarningParserActor.scala"/>
+    <codefragment><![CDATA[package reportsParsers
+
+import java.io.{ InputStream, InputStreamReader }
+
+import scala.xml.Elem
+import scala.xml.XML.load
+
+import akka.actor.Actor
+import com.amazonaws.services.s3.model.GetObjectRequest
+import model.ParsersResponse.ScalaStyleWarningReport
+import org.apache.commons.io.IOUtils
+import reportsParsers.ParserCalling.Parse
+import util.Constant
+import util.Constant.s3client
+
+class ScalaStyleWarningParserActor extends Actor {
+  val constant = Constant
+  val xmlValidator = new XMLValidator
+
+  override def receive = {
+    case Parse(scalaStyleXml: Elem) =>
+      try {
+        val in: InputStream = IOUtils.toInputStream(scalaStyleXml.toString(), "UTF-8")
+        if (xmlValidator.validate(in, constant.scalastylewarningXSD)) {
+          if ((scalaStyleXml \\ "checkstyle").isEmpty) {
+            sender ! None
+          } else {
+            println("else condition scalastyle parser")
+            val result = for {
+              check <- scalaStyleXml \\ constant.ERROR
+              if (check \ constant.SEVERITY).text == constant.WARNING ||
+                (check \ constant.SEVERITY).text == constant.WARNINGTEXT
+              node <- check
+            } yield {
+              node
+            }
+            sender ! Some(ScalaStyleWarningReport(result.length.toString))
+          }
+
+        } else {
+          println("\n\n==================invalid parser===========================\n\n")
+        }
+      } catch {
+        case ex: Exception => sender ! None
+      }
+  }
+}]]></codefragment>
+  </duplication>
+  <duplication lines="64" tokens="232">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/LinksDbService.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/LinksDbService.scala"/>
+    <codefragment><![CDATA[package dbservice
+
+import anorm._
+import com.google.inject.Inject
+import model.Collaborator.{ PendingInvite, LinkDetail }
+import parser.ParserHelper
+import play.api.db.Database
+import util.SqlQuery._
+import util.Constant.TRIAL_PLAN_LINKS_LIMIT
+
+class LinksDbService @Inject() (db: Database) {
+
+  def insertLink(linkDetails: LinkDetail): Unit = {
+    db.withConnection { implicit connection =>
+      SQL(INSERT_LINK)
+        .on(
+          "invite_id" -> linkDetails.invite_id,
+          "username" -> linkDetails.username,
+          "admin_name" -> linkDetails.admin_name,
+          "project_name" -> linkDetails.project_name,
+          "is_expired" -> linkDetails.is_expired
+        ).executeInsert()
+    }
+  }
+
+  def destroyLink(id: String): Int = {
+    db.withConnection { implicit connection =>
+      SQL(UPDATE_LINK)
+        .on(
+          "invite_id" -> id
+        ).executeUpdate()
+    }
+  }
+
+  def getLink(id: String): List[LinkDetail] = {
+    db.withConnection { implicit connection =>
+      SQL(GET_LINK)
+        .on(
+          "invite_id" -> id
+        ).as(ParserHelper.linkDetailParser *)
+    }
+  }
+
+  def countPendingInvites(admin_name: String, project_name: String): Long = {
+    db.withConnection { implicit connection =>
+      SQL(IS_LINK_LIMIT_EXPIRED)
+        .on(
+          "admin_name" -> admin_name,
+          "project_name" -> project_name
+        ).as(SqlParser.scalar[Long].single)
+    }
+  }
+
+  def getPendingInvites(project_name: String, admin_name: String): List[PendingInvite] = {
+    db.withConnection { implicit connection =>
+      SQL(GET_PENDING_INVITES)
+        .on(
+          "admin_name" -> admin_name,
+          "project_name" -> project_name
+        ).as(ParserHelper.pendingInviteParser *)
+    }
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="35" tokens="220">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/CopyPasteDetectorParserActor.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/CopyPasteDetectorParserActor.scala"/>
+    <codefragment><![CDATA[package reportsParsers
+
+import java.io.InputStream
+
+import scala.xml.Elem
+
+import akka.actor.Actor
+import model.ParsersResponse.CopyPasteDetectorReport
+import org.apache.commons.io.IOUtils
+import reportsParsers.ParserCalling.Parse
+import util.Constant
+
+class CopyPasteDetectorParserActor extends Actor {
+  val constant = Constant
+  val xmlValidator = new XMLValidator
+
+  override def receive = {
+    case Parse(cpdXml: Elem) =>
+      try {
+        val in: InputStream = IOUtils.toInputStream(cpdXml.toString(), "UTF-8")
+        if (xmlValidator.validate(in, constant.cpdXSD)) {
+          if ((cpdXml \\ "pmd-cpd").isEmpty) {
+            sender ! None
+          } else {
+            println("============else cpd - parse - try ==============")
+            sender ! Some(CopyPasteDetectorReport((cpdXml \\ constant.DUPLICATION).length.toString))
+          }
+        } else {
+          println("\n\n==================invalid parser===========================\n\n")
+        }
+      } catch {
+        case ex: Exception => sender ! None
+      }
+  }
+}]]></codefragment>
+  </duplication>
+  <duplication lines="34" tokens="190">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/model/ParsersResponse.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/model/ParsersResponse.scala"/>
+    <codefragment><![CDATA[package model
+
+trait Result
+
+object ParsersResponse {
+  case class ScalaStyleWarningReport(result: String = "") extends Result
+
+  case class ScalaStyleXmlReport(result: String = "") extends Result
+
+  case class CopyPasteDetectorReport(result: String = "") extends Result
+
+  case class ScoverageReport(result: String = "") extends Result
+
+  case class ScapegoatReport(error: String = "", warn: String = "", info: String = "") extends Result
+
+  case class LOCReport(result: String = "") extends Result
+
+  case class ScapegoatHtmlReport(result: String = "") extends Result
+
+  case class Reports(
+    projectName: String,
+    moduleName: String,
+    scalaStyleWarningReport: ScalaStyleWarningReport = ScalaStyleWarningReport(),
+    scalaStyleXmlReport: ScalaStyleXmlReport = ScalaStyleXmlReport(),
+    scapegoatReport: ScapegoatReport = ScapegoatReport(),
+    scapegoatHtmlReport: ScapegoatHtmlReport = ScapegoatHtmlReport(),
+    copyPasteDetectorReport: CopyPasteDetectorReport = CopyPasteDetectorReport(),
+    scoverageReport: ScoverageReport = ScoverageReport(),
+    locReport: LOCReport = LOCReport()
+  )
+
+  case class ModulesReport(moduleName: String, data: Reports)
+  case class DashBoardResult(projectName: String, moduleInformation: List[ModulesReport])
+}]]></codefragment>
+  </duplication>
+  <duplication lines="36" tokens="187">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/ScoverageParserActor.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/ScoverageParserActor.scala"/>
+    <codefragment><![CDATA[package reportsParsers
+
+import java.io.InputStream
+
+import scala.xml.Elem
+
+import akka.actor.Actor
+import model.ParsersResponse.ScoverageReport
+import org.apache.commons.io.IOUtils
+import reportsParsers.ParserCalling.Parse
+import util.Constant
+
+class ScoverageParserActor extends Actor {
+  val constant = Constant
+  val xmlValidator = new XMLValidator
+
+  override def receive = {
+    case Parse(scoverageXml: Elem) =>
+      try {
+        val in: InputStream = IOUtils.toInputStream(scoverageXml.toString(), "UTF-8")
+        if (xmlValidator.validate(in, constant.scoverageXSD)) {
+          val scoverage = scoverageXml \\ constant.SCOVERAGE \ constant.STATEMENTRATE
+          if (scoverage.isEmpty) {
+            sender ! None
+          } else {
+            println("else condition scpoverage parser")
+            sender ! Some(ScoverageReport(scoverage.toString()))
+          }
+        } else {
+          println("\n\n==================invalid parser===========================\n\n")
+        }
+      } catch {
+        case ex: Exception => sender ! None
+      }
+  }
+}]]></codefragment>
+  </duplication>
+  <duplication lines="44" tokens="184">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/service/ReadParseStoreReportsDataService.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/service/ReadParseStoreReportsDataService.scala"/>
+    <codefragment><![CDATA[package service
+
+import com.amazonaws.services.s3.model.ListObjectsRequest
+import com.google.inject.Inject
+import dbservice.ProjectDbService
+import util.ConfigUtil
+import util.Constant._
+import scala.collection.JavaConverters._
+
+import domain.ReadParseStoreReportsData
+
+/**
+ * To be removed after Kafka Integration
+ */
+class ReadParseStoreReportsDataService @Inject() (
+    projectDbService: ProjectDbService, readParseStoreReportsData: ReadParseStoreReportsData
+) {
+  //def getPathFromQueue
+
+  def readParseStoreReportsDataService(): Unit = {
+    //Find projects in S3
+    val projectListing = getListofObjectsFromS3("")
+
+    //Find projects in database
+    val projectNamesinDB = projectDbService.getAllProjectNames()
+
+    //find common projects between database and S3
+    val commonProjectList = projectListing.filter(project => projectNamesinDB.contains(project.split("/")(0)))
+
+    for (project <- commonProjectList) {
+      val moduleListing = getListofObjectsFromS3(project)
+      for (module <- moduleListing)
+        readParseStoreReportsData.processModuleReports(module)
+    }
+
+  }
+
+  def getListofObjectsFromS3(prefix: String): List[String] = {
+    val bucketName = ConfigUtil.findBucketName
+    val listProjectRequest = new ListObjectsRequest().withBucketName(bucketName).withPrefix(prefix).withDelimiter("/")
+    val objectListing = s3client.listObjects(listProjectRequest).getCommonPrefixes.asScala.toList
+    objectListing
+  }
+}]]></codefragment>
+  </duplication>
+  <duplication lines="29" tokens="176">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/XMLValidator.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/XMLValidator.scala"/>
+    <codefragment><![CDATA[package reportsParsers
+
+/**
+ * Created by knoldus on 9/11/17.
+ */
+
+import java.io.InputStream
+import javax.xml.transform.stream.StreamSource
+import javax.xml.validation.SchemaFactory
+
+import org.xml.sax.SAXException
+
+class XMLValidator {
+  def validate(xmlFile: InputStream, xsdFile: String): Boolean = {
+    try {
+      println(":::::::::::::::::::::: inside validate method ::::::::::::::::::::::::::::::")
+      val schemaLang = "http://www.w3.org/2001/XMLSchema"
+      val factory = SchemaFactory.newInstance(schemaLang)
+      val schema = factory.newSchema(new StreamSource(xsdFile))
+      val validator = schema.newValidator()
+      validator.validate(new StreamSource(xmlFile))
+    } catch {
+      case ex: SAXException =>
+        ex.printStackTrace(); return false
+      case ex: Exception => ex.printStackTrace()
+    }
+    true
+  }
+}]]></codefragment>
+  </duplication>
+  <duplication lines="35" tokens="174">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/ScalaStyleXmlReportParserActor.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/ScalaStyleXmlReportParserActor.scala"/>
+    <codefragment><![CDATA[package reportsParsers
+
+import java.io.InputStream
+
+import scala.xml.Elem
+
+import akka.actor.Actor
+import model.ParsersResponse.ScalaStyleXmlReport
+import org.apache.commons.io.IOUtils
+import reportsParsers.ParserCalling.Parse
+import util.Constant
+
+class ScalaStyleXmlReportParserActor extends Actor {
+  val constant = Constant
+  val xmlValidator = new XMLValidator
+
+  override def receive = {
+    case Parse(content: Elem) =>
+      try {
+        val xmlString = content.toString()
+        val in: InputStream = IOUtils.toInputStream(xmlString, "UTF-8")
+        if (xmlValidator.validate(in, constant.scalastylewarningXSD)) {
+          if (xmlString contains "checkstyle") {
+            sender ! Some(ScalaStyleXmlReport(xmlString))
+          } else {
+            sender ! None
+          }
+        } else {
+          println("\n\n==================invalid parser===========================\n\n")
+        }
+      } catch {
+        case ex: Exception => sender ! None
+      }
+  }
+}]]></codefragment>
+  </duplication>
+  <duplication lines="41" tokens="169">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/parser/ParserHelper.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/parser/ParserHelper.scala"/>
+    <codefragment><![CDATA[package parser
+
+import anorm.SqlParser._
+import anorm.~
+import model.Collaborator.{ PendingInvite, LinkDetail, Collaborator }
+
+object ParserHelper {
+
+  val collaboratorParser = {
+    get[String]("username") ~
+      get[String]("project") ~
+      get[String]("is_admin") map {
+        case username ~ project ~ is_admin => Collaborator(username, project, is_admin)
+      }
+  }
+
+  val linkDetailParser = {
+    get[String]("invite_id") ~
+      get[String]("username") ~
+      get[String]("admin_name") ~
+      get[String]("project_name") ~
+      get[String]("is_expired") map {
+        case invite_id ~ username ~ admin_name ~ project_name ~ is_expired => LinkDetail(invite_id, username, admin_name, project_name, is_expired)
+      }
+  }
+
+  val passwordLinkParser = {
+    get[String]("id") ~
+      get[String]("email") ~
+      get[String]("is_expired") map {
+        case id ~ email ~ is_expired => (id, email, is_expired)
+      }
+  }
+
+  val pendingInviteParser = {
+    get[String]("invite_id") ~
+      get[String]("username") map {
+        case invite_id ~ username => PendingInvite(invite_id, username)
+      }
+  }
+}]]></codefragment>
+  </duplication>
+  <duplication lines="32" tokens="166">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/HelpPageController.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/HelpPageController.scala"/>
+    <codefragment><![CDATA[package controllers
+
+import javax.inject.Inject
+
+import dbservice.AccountSettingsDbService
+import org.joda.time.DateTime
+import play.api.mvc.{ Action, AnyContent, Controller }
+import play.api.Play.current
+import play.api.i18n.Messages.Implicits._
+import play.api.i18n.Messages
+import play.api.routing.JavaScriptReverseRouter
+
+class HelpPageController @Inject() (accountSettingsDbService: AccountSettingsDbService) extends Controller {
+
+  def help: Action[AnyContent] = Action { implicit request =>
+    //    Ok(views.html.help()).flashing("message" -> "")
+    val username = request.session.get("username")
+    username match {
+      case Some(user) => {
+        val userEmail = accountSettingsDbService.showEmail(username.headOption.fold("")(username => username))
+        Ok(views.html.help(user, userEmail)).withSession("username" -> user).withHeaders(
+          CACHE_CONTROL -> "no-cache",
+          PRAGMA -> "no-cache",
+          CACHE_CONTROL -> "no-store"
+        ).withDateHeaders(EXPIRES -> DateTime.now())
+      }
+      case None => Redirect("/login").flashing("error" -> "No proper user signed in.")
+    }
+
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="32" tokens="157">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/util/ConfigUtil.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/util/ConfigUtil.scala"/>
+    <codefragment><![CDATA[package util
+
+import scala.collection.JavaConverters._
+import scala.language.postfixOps
+import util.Constant._
+/**
+ * Created by knoldus on 22/7/16.
+ */
+trait ConfigUtil {
+
+  val constant = Constant
+
+  /**
+   * fetch the project path and version from the application config file.
+   *
+   * @return Map of scala version with paths and build
+   */
+  def findProjectPathsFromConfig: Map[(String, String), String] = {
+    val projectsPaths = conf.getConfigList("project-paths").asScala
+    ((projectsPaths toList) map { project => project.getString("path") -> project.getString("version") -> project.getString("multi-build")
+    }) toMap
+  }
+
+  def findSchedulerIntervalFromConfig: Int = conf.getInt("scheduler-interval")
+
+  def findBucketName: String = {
+    val projectsPaths = conf.getConfigList("project-paths").asScala.toList
+    projectsPaths map { project => project.getString("path") } head
+  }
+}
+
+object ConfigUtil extends ConfigUtil]]></codefragment>
+  </duplication>
+  <duplication lines="39" tokens="142">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/PasswordLinksDbService.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/PasswordLinksDbService.scala"/>
+    <codefragment><![CDATA[package dbservice
+
+import anorm._
+import com.google.inject.Inject
+import parser.ParserHelper
+import play.api.db.Database
+import util.SqlQuery._
+
+class PasswordLinksDbService @Inject() (db: Database) {
+
+  def insertLink(id: String, email: String): Unit = {
+    db.withConnection { implicit connection =>
+      SQL(INSERT_PASSWORD_LINK)
+        .on(
+          "id" -> id,
+          "email" -> email,
+          "is_expired" -> "false"
+        ).executeInsert()
+    }
+  }
+
+  def destroyLink(id: String): Int = {
+    db.withConnection { implicit connection =>
+      SQL(UPDATE_PASSWORD_LINK)
+        .on(
+          "id" -> id
+        ).executeUpdate()
+    }
+  }
+
+  def getLink(id: String): List[(String, String, String)] = {
+    db.withConnection { implicit connection =>
+      SQL(GET_PASSWORD_LINK)
+        .on(
+          "id" -> id
+        ).as(ParserHelper.passwordLinkParser *)
+    }
+  }
+}]]></codefragment>
+  </duplication>
+  <duplication lines="28" tokens="133">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/RegistrationDbService.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/dbservice/RegistrationDbService.scala"/>
+    <codefragment><![CDATA[package dbservice
+
+import anorm.{ SqlParser, _ }
+import com.google.inject.Inject
+import play.api.Logger
+import play.api.db.Database
+import util.SqlQuery._
+/**
+ * Created by knoldus on 7/9/16.
+ */
+class RegistrationDbService @Inject() (db: Database) {
+
+  def registerUser(username: String, password: String, email_id: String): Unit = {
+    db.withConnection { implicit connection =>
+      SQL(ADD_NEW_USER)
+        .on("username" -> username, "password" -> password, "email_id" -> email_id)
+        .executeInsert()
+    }
+  }
+  def getUserName(username: String): List[String] = {
+    db.withConnection { implicit connection =>
+      val usernames = SQL(GET_USERNAME)
+        .on("username" -> username)
+        .as(SqlParser.str("username").*)
+      usernames
+    }
+  }
+}]]></codefragment>
+  </duplication>
+  <duplication lines="26" tokens="124">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/LogoutController.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/LogoutController.scala"/>
+    <codefragment><![CDATA[package controllers
+
+import org.joda.time.DateTime
+import play.api.mvc.{ Action, AnyContent, _ }
+import play.api.i18n.Messages.Implicits._
+import play.mvc.Http
+
+/**
+ * Created by knoldus on 23/5/16.
+ */
+class LogoutController extends Controller {
+
+  def logout: Action[AnyContent] = Action { implicit request =>
+    val call = request.cookies.get("invitationId") match {
+      case Some(invitationId) => Redirect(s"/login?id=${invitationId.value}")
+      case None => Redirect("/login")
+    }
+
+    call.withNewSession.withHeaders(
+      CACHE_CONTROL -> "no-cache",
+      PRAGMA -> "no-cache",
+      CACHE_CONTROL -> "no-store"
+    ).withDateHeaders(EXPIRES -> DateTime.now()).discardingCookies(DiscardingCookie("invitationId"))
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="31" tokens="121">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/model/DashboardReports.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/model/DashboardReports.scala"/>
+    <codefragment><![CDATA[package model
+
+import org.joda.time.DateTime
+
+/**
+ * Created by knoldus on 19/8/16.
+ */
+object DashboardReports {
+
+  case class ProjectDetails(
+    scalaStyle: String,
+    scapegoatWarning: String,
+    scapegoatError: String,
+    scapegoatInfo: String,
+    cpd: String,
+    scoverage: String,
+    timeStamp: DateTime
+  )
+
+  case class DashboardDetails(projectName: String, moduleName: String,
+    scalaStyle: String, scapegoatWarning: String,
+    scapegoatInfo: String, scapegoatError: String,
+    scoverage: String, cpd: String,
+    loc: String, modifiedDate: String)
+
+  case class ProjectReports(projectName: String, moduleName: String,
+    scalastyleXml: String, scapegoatHtml: String)
+
+  case class NewDashboardDetails(projectName: String, moduleName: String, data: String, modifiedDate: String, timestamp: DateTime)
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="24" tokens="113">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/util/LoginUtil.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/util/LoginUtil.scala"/>
+    <codefragment><![CDATA[package util
+
+import com.google.inject.Inject
+import com.typesafe.config.ConfigFactory
+import dbservice.LoginDbService
+import model.Login.UserLogin
+import play.api.Logger
+import play.api.db.Database
+
+import scala.collection.JavaConverters._
+
+/**
+ * Created by knoldus on 22/5/16.
+ */
+class LoginUtil @Inject() (loginDbService: LoginDbService) {
+
+  def authenticateUser(usernameOrEmail: String, password: Option[String]): String = {
+    val encryptedPassword = CommonUtil.md5(password).fold("")(userPassword => userPassword)
+    val username = loginDbService.getUsernamePassword(usernameOrEmail, encryptedPassword)
+    Logger.info("username" + username)
+    Logger.info(username.toString())
+    if (username.length == 1) (username.headOption.fold("")(identity)) else "fail"
+  }
+}]]></codefragment>
+  </duplication>
+  <duplication lines="27" tokens="112">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/ErrorHandlerController.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/controllers/ErrorHandlerController.scala"/>
+    <codefragment><![CDATA[package controllers
+
+import play.api.http.HttpErrorHandler
+import play.api.mvc.{ Action, AnyContent, Request, RequestHeader, Result }
+import play.api.mvc.Results._
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent._
+
+/**
+ * Created by knoldus on 12/9/16.
+ */
+class ErrorHandlerController extends HttpErrorHandler {
+
+  def onClientError(request: RequestHeader, statusCode: Int, message: String): Future[Result] = {
+    statusCode match {
+      case play.mvc.Http.Status.NOT_FOUND => Future(Ok(views.html.error()))
+      case _ => Future(Ok(views.html.error()))
+    }
+  }
+
+  def onServerError(request: RequestHeader, exception: Throwable): Future[Result] = {
+    Future.successful(
+      InternalServerError(views.html.error())
+    )
+  }
+
+}]]></codefragment>
+  </duplication>
+  <duplication lines="31" tokens="103">
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/LOCParserActor.scala"/>
+    <file line="1"
+          path="/home/knoldus/Documents/CodeSquad/server/app/reportsParsers/LOCParserActor.scala"/>
+    <codefragment><![CDATA[package reportsParsers
+
+import scala.io.Source
+
+import akka.actor.Actor
+import com.amazonaws.services.s3.model.GetObjectRequest
+import model.ParsersResponse.LOCReport
+import reportsParsers.ParserCalling._
+import util.Constant
+import util.Constant.s3client
+
+class LOCParserActor extends Actor {
+  val constant = Constant
+
+  override def receive = {
+    case StringParser(locFile: List[String]) =>
+      try {
+        val numPattern = constant.REGEXP.r
+        val index = locFile.length - 2
+        val regexedString = numPattern.findFirstIn(locFile(index))
+
+        regexedString match {
+          case Some(lines) =>
+            sender ! Some(LOCReport(lines))
+          case None => sender ! None
+        }
+      } catch {
+        case ex: Exception => sender ! None
+      }
+  }
+}]]></codefragment>
+  </duplication>
+  <duplication lines="20" tokens="102">
+    <file line="2" path="/home/knoldus/Documents/CodeSquad/server/app/Global.scala"/>
+    <file line="2" path="/home/knoldus/Documents/CodeSquad/server/app/Global.scala"/>
+    <codefragment><![CDATA[import akka.actor.{ ActorSystem, Props }
+import com.google.inject.Inject
+import com.typesafe.config.ConfigFactory
+import dbservice.SchedulerDbProcess
+import play.api.Application
+import util.ScheduleActor
+import util.ScheduleActor.{ FetchS3Values, SendEmailUpdates }
+
+import scala.concurrent.duration._
+
+class Global @Inject() (play: Application, schedulerDbProcess: SchedulerDbProcess) {
+
+  val conf = ConfigFactory.load()
+  val schedulerInterval = conf.getInt("scheduler-interval")
+  val system = ActorSystem("SchedulerSystem")
+  val schedulerActor = system.actorOf(Props(classOf[ScheduleActor], schedulerDbProcess), "Actor")
+  implicit val ec = system.dispatcher
+  system.scheduler.schedule(0.seconds, schedulerInterval.hours)(schedulerActor ! FetchS3Values)
+  system.scheduler.schedule(schedulerDbProcess.calculateInitialDelay().milliseconds, 24.hours)(schedulerActor ! SendEmailUpdates)
+}]]></codefragment>
+  </duplication>
+</pmd-cpd>
+
